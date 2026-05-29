@@ -668,81 +668,41 @@ impl CfmlCompiler {
                     }
                 }
 
-                self.compile_expression(&assign.value, instructions);
-
                 match &assign.operator {
-                    AssignOp::PlusEqual => {
-                        if let AssignTarget::Variable(name) = &assign.target {
-                            instructions.push(BytecodeOp::LoadLocal(name.clone()));
-                        }
-                        let len = instructions.len();
-                        instructions.swap(len - 2, len - 1);
-                        instructions.push(BytecodeOp::Add);
+                    AssignOp::Equal => {
+                        self.compile_expression(&assign.value, instructions);
                     }
-                    AssignOp::MinusEqual => {
-                        if let AssignTarget::Variable(name) = &assign.target {
-                            instructions.push(BytecodeOp::LoadLocal(name.clone()));
-                        }
-                        let len = instructions.len();
-                        instructions.swap(len - 2, len - 1);
-                        instructions.push(BytecodeOp::Sub);
-                    }
-                    AssignOp::StarEqual => {
-                        if let AssignTarget::Variable(name) = &assign.target {
-                            instructions.push(BytecodeOp::LoadLocal(name.clone()));
-                        }
-                        let len = instructions.len();
-                        instructions.swap(len - 2, len - 1);
-                        instructions.push(BytecodeOp::Mul);
-                    }
-                    AssignOp::SlashEqual => {
+                    AssignOp::PlusEqual
+                    | AssignOp::MinusEqual
+                    | AssignOp::StarEqual
+                    | AssignOp::SlashEqual
+                    | AssignOp::PercentEqual
+                    | AssignOp::ConcatEqual => {
                         match &assign.target {
                             AssignTarget::Variable(name) => {
                                 instructions.push(BytecodeOp::LoadLocal(name.clone()));
-                            }
-                            _ => {}
-                        }
-                        let len = instructions.len();
-                        instructions.swap(len - 2, len - 1);
-                        instructions.push(BytecodeOp::Div);
-                    }
-                    AssignOp::PercentEqual => {
-                        match &assign.target {
-                            AssignTarget::Variable(name) => {
-                                instructions.push(BytecodeOp::LoadLocal(name.clone()));
-                            }
-                            _ => {}
-                        }
-                        let len = instructions.len();
-                        instructions.swap(len - 2, len - 1);
-                        instructions.push(BytecodeOp::Mod);
-                    }
-                    AssignOp::ConcatEqual => {
-                        match &assign.target {
-                            AssignTarget::Variable(name) => {
-                                instructions.push(BytecodeOp::LoadLocal(name.clone()));
-                                let len = instructions.len();
-                                instructions.swap(len - 2, len - 1);
-                                instructions.push(BytecodeOp::Concat);
                             }
                             AssignTarget::StructAccess(obj, member) => {
-                                // Stack: [rhs]. Load current, then Swap + Concat so
-                                // the final stack order is [current, rhs] → [result].
                                 self.compile_expression(obj, instructions);
                                 instructions.push(BytecodeOp::GetProperty(member.clone()));
-                                instructions.push(BytecodeOp::Swap);
-                                instructions.push(BytecodeOp::Concat);
                             }
                             AssignTarget::ArrayAccess(arr, idx) => {
                                 self.compile_expression(arr, instructions);
                                 self.compile_expression(idx, instructions);
                                 instructions.push(BytecodeOp::GetIndex);
-                                instructions.push(BytecodeOp::Swap);
-                                instructions.push(BytecodeOp::Concat);
                             }
                         }
+                        self.compile_expression(&assign.value, instructions);
+                        match &assign.operator {
+                            AssignOp::PlusEqual => instructions.push(BytecodeOp::Add),
+                            AssignOp::MinusEqual => instructions.push(BytecodeOp::Sub),
+                            AssignOp::StarEqual => instructions.push(BytecodeOp::Mul),
+                            AssignOp::SlashEqual => instructions.push(BytecodeOp::Div),
+                            AssignOp::PercentEqual => instructions.push(BytecodeOp::Mod),
+                            AssignOp::ConcatEqual => instructions.push(BytecodeOp::Concat),
+                            AssignOp::Equal => unreachable!(),
+                        }
                     }
-                    AssignOp::Equal => {} // Value already on stack
                 }
 
                 match &assign.target {
