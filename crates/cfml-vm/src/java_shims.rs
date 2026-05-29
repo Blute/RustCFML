@@ -1,8 +1,9 @@
 // Java shim handlers - to be inserted into lib.rs
 
 use cfml_common::dynamic::CfmlValue;
-use cfml_common::vm::CfmlResult;
+use cfml_common::vm::{CfmlError, CfmlResult};
 use indexmap::IndexMap;
+use regex::Regex;
 use std::sync::Arc;
 
 pub fn handle_java_messagedigest(
@@ -116,6 +117,136 @@ pub fn handle_java_uuid(method: &str, _args: Vec<CfmlValue>, object: &CfmlValue)
         "getvariant" => Ok(CfmlValue::Int(2)),
         _ => Ok(CfmlValue::Null),
     }
+}
+
+pub fn handle_java_regex_pattern(
+    method: &str,
+    args: Vec<CfmlValue>,
+    object: &CfmlValue,
+) -> CfmlResult {
+    match method {
+        "init" => {
+            let mut shim = IndexMap::new();
+            shim.insert(
+                "__java_class".to_string(),
+                CfmlValue::String("java.util.regex.pattern".to_string()),
+            );
+            shim.insert("__java_shim".to_string(), CfmlValue::Bool(true));
+            Ok(CfmlValue::strukt(shim))
+        }
+        "compile" => {
+            let pattern = args.first().map(|a| a.as_string()).unwrap_or_default();
+            let rust_pattern = java_regex_to_rust_regex(&pattern);
+            Regex::new(&rust_pattern)
+                .map_err(|e| CfmlError::runtime(format!("Invalid regex pattern: {}", e)))?;
+
+            let mut shim = IndexMap::new();
+            shim.insert(
+                "__java_class".to_string(),
+                CfmlValue::String("java.util.regex.pattern".to_string()),
+            );
+            shim.insert("__java_shim".to_string(), CfmlValue::Bool(true));
+            shim.insert("__pattern".to_string(), CfmlValue::String(pattern));
+            shim.insert(
+                "__rust_pattern".to_string(),
+                CfmlValue::String(rust_pattern),
+            );
+            Ok(CfmlValue::strukt(shim))
+        }
+        "matcher" => {
+            let (pattern, rust_pattern) = match object {
+                CfmlValue::Struct(shim) => (
+                    shim.get("__pattern")
+                        .map(|v| v.as_string())
+                        .unwrap_or_default(),
+                    shim.get("__rust_pattern")
+                        .map(|v| v.as_string())
+                        .unwrap_or_else(|| {
+                            shim.get("__pattern")
+                                .map(|v| java_regex_to_rust_regex(&v.as_string()))
+                                .unwrap_or_default()
+                        }),
+                ),
+                _ => (String::new(), String::new()),
+            };
+            let text = args.first().map(|a| a.as_string()).unwrap_or_default();
+
+            let mut matcher = IndexMap::new();
+            matcher.insert(
+                "__java_class".to_string(),
+                CfmlValue::String("java.util.regex.matcher".to_string()),
+            );
+            matcher.insert("__java_shim".to_string(), CfmlValue::Bool(true));
+            matcher.insert("__pattern".to_string(), CfmlValue::String(pattern));
+            matcher.insert(
+                "__rust_pattern".to_string(),
+                CfmlValue::String(rust_pattern),
+            );
+            matcher.insert("__text".to_string(), CfmlValue::String(text));
+            Ok(CfmlValue::strukt(matcher))
+        }
+        "pattern" => match object {
+            CfmlValue::Struct(shim) => Ok(shim
+                .get("__pattern")
+                .cloned()
+                .unwrap_or_else(|| CfmlValue::String(String::new()))),
+            _ => Ok(CfmlValue::String(String::new())),
+        },
+        _ => Ok(CfmlValue::Null),
+    }
+}
+
+pub fn handle_java_regex_matcher(
+    method: &str,
+    args: Vec<CfmlValue>,
+    object: &CfmlValue,
+) -> CfmlResult {
+    let (pattern, text) = match object {
+        CfmlValue::Struct(shim) => (
+            shim.get("__rust_pattern")
+                .map(|v| v.as_string())
+                .unwrap_or_else(|| {
+                    shim.get("__pattern")
+                        .map(|v| java_regex_to_rust_regex(&v.as_string()))
+                        .unwrap_or_default()
+                }),
+            shim.get("__text")
+                .map(|v| v.as_string())
+                .unwrap_or_default(),
+        ),
+        _ => (String::new(), String::new()),
+    };
+    let re = Regex::new(&pattern)
+        .map_err(|e| CfmlError::runtime(format!("Invalid regex pattern: {}", e)))?;
+
+    match method {
+        "find" => Ok(CfmlValue::Bool(re.find(&text).is_some())),
+        "matches" => Ok(CfmlValue::Bool(
+            re.find(&text)
+                .map(|m| m.start() == 0 && m.end() == text.len())
+                .unwrap_or(false),
+        )),
+        "group" => {
+            let index = args
+                .first()
+                .map(|a| a.as_string().parse::<usize>().unwrap_or(0))
+                .unwrap_or(0);
+            let value = re
+                .captures(&text)
+                .and_then(|captures| captures.get(index).map(|m| m.as_str().to_string()))
+                .unwrap_or_default();
+            Ok(CfmlValue::String(value))
+        }
+        "groupcount" => {
+            let count = re.captures_len().saturating_sub(1);
+            Ok(CfmlValue::Int(count as i64))
+        }
+        _ => Ok(CfmlValue::Null),
+    }
+}
+
+fn java_regex_to_rust_regex(pattern: &str) -> String {
+    pattern.replace("\\/", "/").replace("\\_", "_")
 }
 
 pub fn handle_java_thread(method: &str, _args: Vec<CfmlValue>, object: &CfmlValue) -> CfmlResult {

@@ -20,8 +20,9 @@ pub use session_store::{MemoryStore, SessionStore};
 use java_shims::{
     handle_java_collections, handle_java_concurrenthashmap, handle_java_concurrentlinkedqueue,
     handle_java_file, handle_java_inetaddress, handle_java_linkedhashmap,
-    handle_java_messagedigest, handle_java_paths, handle_java_stringbuilder, handle_java_system,
-    handle_java_thread, handle_java_treemap, handle_java_uuid,
+    handle_java_messagedigest, handle_java_paths, handle_java_regex_matcher,
+    handle_java_regex_pattern, handle_java_stringbuilder, handle_java_system, handle_java_thread,
+    handle_java_treemap, handle_java_uuid,
 };
 
 pub type BuiltinFunction = fn(Vec<CfmlValue>) -> CfmlResult;
@@ -5836,6 +5837,9 @@ impl CfmlVirtualMachine {
                                 "java.util.uuid" => {
                                     handle_java_uuid("init", empty_args, &CfmlValue::Null)
                                 }
+                                "java.util.regex.pattern" => {
+                                    handle_java_regex_pattern("init", empty_args, &CfmlValue::Null)
+                                }
                                 "java.lang.thread" => {
                                     handle_java_thread("init", empty_args, &CfmlValue::Null)
                                 }
@@ -7813,6 +7817,8 @@ impl CfmlVirtualMachine {
                         handle_java_messagedigest(&m, all_args, object)
                     }
                     "java.util.uuid" => handle_java_uuid(&m, all_args, object),
+                    "java.util.regex.pattern" => handle_java_regex_pattern(&m, all_args, object),
+                    "java.util.regex.matcher" => handle_java_regex_matcher(&m, all_args, object),
                     "java.lang.thread" | "java.lang.threadgroup" => {
                         handle_java_thread(&m, all_args, object)
                     }
