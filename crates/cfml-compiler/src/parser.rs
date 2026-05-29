@@ -3395,18 +3395,78 @@ impl Parser {
         let mut elements = Vec::new();
 
         if !self.check(&Token::RBracket) {
-            loop {
-                if self.check(&Token::RBracket) {
-                    break; // trailing comma
+            if self.match_token(&Token::DotDotDot) {
+                let expr = self.parse_expression()?;
+                elements.push(Expression::Spread(Box::new(expr)));
+                while self.match_token(&Token::Comma) {
+                    if self.check(&Token::RBracket) {
+                        break;
+                    }
+                    if self.match_token(&Token::DotDotDot) {
+                        let expr = self.parse_expression()?;
+                        elements.push(Expression::Spread(Box::new(expr)));
+                    } else {
+                        elements.push(self.parse_expression()?);
+                    }
                 }
-                if self.match_token(&Token::DotDotDot) {
-                    let expr = self.parse_expression()?;
-                    elements.push(Expression::Spread(Box::new(expr)));
+            } else {
+                let is_key_eq = matches!(self.peek(0), Token::Identifier(_))
+                    && matches!(self.peek(1), Token::Equal);
+                let first = if is_key_eq {
+                    self.parse_ternary()?
                 } else {
-                    elements.push(self.parse_expression()?);
-                }
-                if !self.match_token(&Token::Comma) {
-                    break;
+                    self.parse_expression()?
+                };
+
+                if self.match_token(&Token::Colon) || self.match_token(&Token::Equal) {
+                    let mut pairs = Vec::new();
+                    let value = self.parse_expression()?;
+                    pairs.push((first, value));
+
+                    while self.match_token(&Token::Comma) {
+                        if self.check(&Token::RBracket) {
+                            break;
+                        }
+                        if self.match_token(&Token::DotDotDot) {
+                            let expr = self.parse_expression()?;
+                            pairs.push((Expression::Spread(Box::new(expr.clone())), expr));
+                        } else {
+                            let is_key_eq = matches!(self.peek(0), Token::Identifier(_))
+                                && matches!(self.peek(1), Token::Equal);
+                            let key = if is_key_eq {
+                                self.parse_ternary()?
+                            } else {
+                                self.parse_expression()?
+                            };
+
+                            if self.match_token(&Token::Colon) || self.match_token(&Token::Equal) {
+                                let value = self.parse_expression()?;
+                                pairs.push((key, value));
+                            } else {
+                                pairs.push((key.clone(), key));
+                            }
+                        }
+                    }
+
+                    self.consume(&Token::RBracket)?;
+                    return Ok(Expression::Struct(Struct {
+                        pairs,
+                        ordered: true,
+                        location: self.current_location(),
+                    }));
+                } else {
+                    elements.push(first);
+                    while self.match_token(&Token::Comma) {
+                        if self.check(&Token::RBracket) {
+                            break;
+                        }
+                        if self.match_token(&Token::DotDotDot) {
+                            let expr = self.parse_expression()?;
+                            elements.push(Expression::Spread(Box::new(expr)));
+                        } else {
+                            elements.push(self.parse_expression()?);
+                        }
+                    }
                 }
             }
         }
