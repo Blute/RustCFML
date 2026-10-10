@@ -633,6 +633,11 @@ include "harness.cfm";
 <cf_runtest file="tags/test_cfhttp_multiparam_url.cfm" />
 <cf_runtest file="tags/test_cfqueryparam_interpolated_value.cfm" />
 <cf_runtest file="tags/test_cfqueryparam_in_transaction.cfm" />
+<!--- - cfqueryparam_null_expression: null="#len(x) EQ 0#" (any expression, even --->
+<!--- "#true#") must bind SQL NULL as Lucee does; RustCFML honours only a literal --->
+<!--- null="true"/"yes" and binds the value, so a blank field is stored as '' --->
+<!--- where the code asked for NULL. --->
+<cf_runtest file="tags/test_cfqueryparam_null_expression.cfm" />
 <!--- - cfqueryparam_script_form: cfqueryparam must be callable as a script --->
 <!--- statement (positional AND attributeCollection) inside a script --->
 <!--- cfquery(){} block, like the <cfqueryparam> tag. RustCFML throws --->
