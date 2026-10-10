@@ -277,6 +277,174 @@ pub fn apply_native_modules(vm: &mut CfmlVirtualMachine) {
 #[cfg(not(target_arch = "wasm32"))]
 static LOADED_EXTENSIONS: OnceLock<Vec<extensions::Extension>> = OnceLock::new();
 
+/// A datasource backed by an extension: the engine's [`DynamicDbDriver`] over
+/// the C-ABI driver table a `.rcx` declares.
+///
+/// Built once at load and shared by every request. The instance pointer is
+/// module-owned and lives for the process — extensions are never unloaded —
+/// so there is nothing to free and no lifetime to track.
+#[cfg(not(target_arch = "wasm32"))]
+struct ExtensionDatasource {
+    driver: cfml_vm::foreign::ForeignDbDriver,
+    data: *mut std::ffi::c_void,
+    name: String,
+}
+
+// The pointer is module-owned, immutable for the process, and the driver
+// table's `Send + Sync` is asserted by the ABI contract: the module owns its
+// own synchronisation because a datasource is shared by every request.
+#[cfg(not(target_arch = "wasm32"))]
+unsafe impl Send for ExtensionDatasource {}
+#[cfg(not(target_arch = "wasm32"))]
+unsafe impl Sync for ExtensionDatasource {}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl ExtensionDatasource {
+    fn build(
+        driver: cfml_vm::foreign::ForeignDbDriver,
+        name: &str,
+        args: Vec<cfml_common::dynamic::CfmlValue>,
+    ) -> Result<Self, cfml_common::vm::CfmlError> {
+        let data = driver.construct(args)?;
+        Ok(Self { driver, data, name: name.to_string() })
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl cfml_stdlib::DynamicDbDriver for ExtensionDatasource {
+    fn execute(
+        &self,
+        sql: &str,
+        params_arg: &cfml_common::dynamic::CfmlValue,
+        return_type: &str,
+    ) -> cfml_common::vm::CfmlResult {
+        self.driver.execute(self.data, sql, params_arg, return_type)
+    }
+
+    fn dbinfo(
+        &self,
+        info_type: &str,
+        attrs: &cfml_common::dynamic::CfmlValue,
+    ) -> Option<cfml_common::vm::CfmlResult> {
+        match self.driver.dbinfo(self.data, info_type, attrs) {
+            // A NULL return is the driver declining this `type=`, so the
+            // engine's own metadata handling answers it.
+            Ok(cfml_common::dynamic::CfmlValue::Null) => None,
+            other => Some(other),
+        }
+    }
+
+    fn begin(
+        &self,
+        isolation: &str,
+    ) -> Result<Box<dyn cfml_stdlib::DynamicTransaction>, cfml_common::vm::CfmlError> {
+        let txn = self.driver.begin(self.data, isolation)?;
+        Ok(Box::new(ExtensionTransaction {
+            driver: self.driver,
+            txn,
+            name: self.name.clone(),
+        }))
+    }
+}
+
+/// One open transaction on an [`ExtensionDatasource`].
+#[cfg(not(target_arch = "wasm32"))]
+struct ExtensionTransaction {
+    driver: cfml_vm::foreign::ForeignDbDriver,
+    txn: *mut std::ffi::c_void,
+    name: String,
+}
+
+// Held by one request at a time and never shared across threads; `Send` is
+// what the engine's type-erased transaction slot requires.
+#[cfg(not(target_arch = "wasm32"))]
+unsafe impl Send for ExtensionTransaction {}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl cfml_stdlib::DynamicTransaction for ExtensionTransaction {
+    fn execute(
+        &mut self,
+        sql: &str,
+        params_arg: &cfml_common::dynamic::CfmlValue,
+        return_type: &str,
+    ) -> cfml_common::vm::CfmlResult {
+        self.driver.txn_execute(self.txn, sql, params_arg, return_type)
+    }
+    fn commit(&mut self) -> Result<(), cfml_common::vm::CfmlError> {
+        self.driver.txn_commit(self.txn)
+    }
+    fn rollback(&mut self) -> Result<(), cfml_common::vm::CfmlError> {
+        self.driver.txn_rollback(self.txn)
+    }
+    fn supports_savepoints(&self) -> bool {
+        self.driver.supports_savepoints()
+    }
+    fn savepoint(&mut self, name: &str) -> Result<(), cfml_common::vm::CfmlError> {
+        self.driver.txn_savepoint(self.txn, cfml_module_abi::savepoint_op::SET, name)
+    }
+    fn release_savepoint(&mut self, name: &str) -> Result<(), cfml_common::vm::CfmlError> {
+        self.driver.txn_savepoint(self.txn, cfml_module_abi::savepoint_op::RELEASE, name)
+    }
+    fn rollback_to_savepoint(&mut self, name: &str) -> Result<(), cfml_common::vm::CfmlError> {
+        self.driver
+            .txn_savepoint(self.txn, cfml_module_abi::savepoint_op::ROLLBACK_TO, name)
+    }
+}
+
+/// Driver KINDS an extension supplies, by the name a datasource's `driver` key
+/// uses. Each configured datasource of that kind gets its own instance.
+#[cfg(not(target_arch = "wasm32"))]
+static EXTENSION_DRIVERS: OnceLock<Vec<(String, cfml_vm::foreign::ForeignDbDriver)>> =
+    OnceLock::new();
+
+/// A datasource's settings, as the struct a driver's constructor receives.
+#[cfg(not(target_arch = "wasm32"))]
+fn datasource_cfg_as_struct(ds: &cfml_config::schema::DatasourceCfg) -> cfml_common::dynamic::CfmlValue {
+    use cfml_common::dynamic::CfmlValue;
+    let mut m = cfml_common::dynamic::ValueMap::default();
+    for (k, v) in [
+        ("driver", ds.driver.as_str()),
+        ("class", ds.class.as_str()),
+        ("host", ds.host.as_str()),
+        ("port", ds.port.as_str()),
+        ("database", ds.database.as_str()),
+        ("username", ds.username.as_str()),
+        ("password", ds.password.as_str()),
+        ("connectionString", ds.connection_string.as_str()),
+    ] {
+        if !v.is_empty() {
+            m.insert(k.to_string(), CfmlValue::string(v.to_string()));
+        }
+    }
+    CfmlValue::strukt(m)
+}
+
+/// Bind `name` to the extension driver of kind `kind`, built with `cfg`.
+/// Returns false when no extension supplies that kind.
+#[cfg(not(target_arch = "wasm32"))]
+fn bind_extension_datasource(
+    name: &str,
+    kind: &str,
+    cfg: cfml_common::dynamic::CfmlValue,
+) -> bool {
+    let Some(drivers) = EXTENSION_DRIVERS.get() else {
+        return false;
+    };
+    let Some((_, driver)) = drivers.iter().find(|(k, _)| k.eq_ignore_ascii_case(kind)) else {
+        return false;
+    };
+    match ExtensionDatasource::build(*driver, name, vec![cfg]) {
+        Ok(d) => {
+            cfml_stdlib::register_dynamic_datasource(name, std::sync::Arc::new(d));
+            true
+        }
+        Err(e) => {
+            log::warn!("datasource '{}': driver '{}' failed to initialise: {}", name, kind, e.message);
+            false
+        }
+    }
+}
+
 /// Resolve, verify and load every `.rcx` extension, once per process.
 ///
 /// Problems are printed rather than swallowed: an extension that fails to load
@@ -317,15 +485,42 @@ pub fn load_extensions(
     if !names.is_empty() {
         cfml_common::builtins_meta::register_foreign_builtin_names(&names);
     }
+    // Datasources an extension backs. Registered here rather than in
+    // `register_foreign_module`, which runs per request: the registry is
+    // process-global and the driver instance is built once. `cfml-vm` cannot do
+    // this itself — its dependency on `cfml-stdlib` is optional.
+    let mut kinds: Vec<(String, cfml_vm::foreign::ForeignDbDriver)> = Vec::new();
+    for ext in &loaded {
+        for (kind, driver) in &ext.module.drivers {
+            kinds.push((kind.clone(), *driver));
+            // The kind doubles as a ready-made datasource name, so
+            // `datasource="greptimedb"` works with no configuration at all.
+            // A datasource declared with `driver: "<kind>"` overwrites this
+            // with a configured instance when the config is read.
+            match ExtensionDatasource::build(
+                *driver,
+                kind,
+                vec![cfml_common::dynamic::CfmlValue::strukt(Default::default())],
+            ) {
+                Ok(d) => cfml_stdlib::register_dynamic_datasource(kind, std::sync::Arc::new(d)),
+                Err(e) => eprintln!(
+                    "Extension warning: {} could not initialise driver '{}': {}",
+                    ext.name, kind, e.message
+                ),
+            }
+        }
+    }
+    let _ = EXTENSION_DRIVERS.set(kinds);
     if verbose && !loaded.is_empty() {
         for ext in &loaded {
             println!(
-                "Loaded extension {} {} ({} bif(s), {} class(es), {} sql fn(s){}) from {}",
+                "Loaded extension {} {} ({} bif(s), {} class(es), {} sql fn(s), {} datasource(s){}) from {}",
                 ext.name,
                 ext.version,
                 ext.module.bifs.len(),
                 ext.module.classes.len(),
                 ext.module.qoq_fns.len(),
+                ext.module.drivers.len(),
                 match &ext.module.cfml_dir {
                     Some(d) => format!(", cfml at {}", d.display()),
                     None => String::new(),
@@ -4234,6 +4429,12 @@ fn populate_datasource_registry(cfg: &RustCfmlConfig) {
             cfml_stdlib::builtins::register_datasource_timeout(&url, ds.connection_timeout);
             if ds.default {
                 cfml_stdlib::builtins::set_default_datasource(url);
+            }
+        } else if bind_extension_datasource(name, &ds.canonical_driver(), datasource_cfg_as_struct(ds)) {
+            // An extension supplies this driver kind; it owns the datasource
+            // from here, including its own connection handling.
+            if ds.default {
+                cfml_stdlib::builtins::set_default_datasource(name.to_string());
             }
         } else {
             log::warn!(

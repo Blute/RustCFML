@@ -34611,12 +34611,19 @@ impl CfmlVirtualMachine {
     /// (Lucee/ACF/BoxLang semantics).
     fn cftransaction_start(&mut self, args: &[CfmlValue], parent_locals: &ValueMap) -> CfmlResult {
         if self.transaction_depth >= 1 {
-            self.transaction_depth += 1;
-            let depth = self.transaction_depth;
+            let depth = self.transaction_depth + 1;
+            // Take the savepoint BEFORE recording the nesting. A driver that
+            // has no savepoints fails here, and leaving `transaction_depth`
+            // already incremented made the ENCLOSING block's rollback look like
+            // a nested one — so the outer transaction kept work it meant to
+            // discard, silently. Nothing is recorded until the savepoint is
+            // actually in place.
+            //
             // Only issue a real savepoint when the outer transaction
             // actually has a live connection. A still-pending block
             // (no resolvable datasource yet) records None so the
             // matching commit/rollback knows there is nothing to do.
+            let mut taken: Option<String> = None;
             if self.transaction_conn.is_some() {
                 let name = format!("cftxn_sp{}", depth);
                 if let (Some(savepoint), Some(conn)) =
@@ -34626,13 +34633,11 @@ impl CfmlVirtualMachine {
                     for (_, extra) in self.transaction_extra_conns.iter_mut() {
                         savepoint(extra, &name)?;
                     }
-                    self.transaction_savepoints.push(Some(name));
-                } else {
-                    self.transaction_savepoints.push(None);
+                    taken = Some(name);
                 }
-            } else {
-                self.transaction_savepoints.push(None);
             }
+            self.transaction_depth = depth;
+            self.transaction_savepoints.push(taken);
             return Ok(CfmlValue::Null);
         }
         // Args: __cftransaction_start("begin", isolation, datasource).

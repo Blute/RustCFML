@@ -387,7 +387,8 @@ fn package(dir: &Path, name: &str, version: &str, lib: &Path) -> Result<PathBuf,
     // That includes the NAME — a crate called `rustcfml-typst` may well declare
     // itself as `typst`, and the loader keys on the declared name.
     let decl = introspect(lib)?;
-    let (bifs, classes, abi_major, tier) = (decl.bifs, decl.classes, decl.abi_major, decl.tier);
+    let (bifs, classes, datasources, abi_major, tier) =
+        (decl.bifs, decl.classes, decl.datasources, decl.abi_major, decl.tier);
     let name = if decl.name.is_empty() { name } else { &decl.name };
     let version = if decl.version.is_empty() { version } else { &decl.version };
 
@@ -441,6 +442,7 @@ fn package(dir: &Path, name: &str, version: &str, lib: &Path) -> Result<PathBuf,
         description: String::new(),
         provides_bifs: bifs,
         provides_classes: classes,
+        provides_datasources: datasources,
         exclusive: Vec::new(),
         libraries,
     };
@@ -542,6 +544,7 @@ struct Decl {
     version: String,
     bifs: Vec<String>,
     classes: Vec<String>,
+    datasources: Vec<String>,
     abi_major: u32,
     tier: u32,
 }
@@ -570,11 +573,22 @@ fn introspect(lib: &Path) -> Result<Decl, String> {
         for i in 0..d.class_count {
             classes.push((*d.classes.add(i)).name.as_str().to_string());
         }
+        // Drivers were appended to `ModuleDecl`, so an extension built before
+        // they existed has a shorter struct and these fields are past its end.
+        let mut datasources = Vec::new();
+        if d.size >= std::mem::offset_of!(abi::ModuleDecl, driver_count) + std::mem::size_of::<usize>()
+            && !d.drivers.is_null()
+        {
+            for i in 0..d.driver_count {
+                datasources.push((*d.drivers.add(i)).name.as_str().to_string());
+            }
+        }
         let out = Decl {
             name: d.name.as_str().to_string(),
             version: d.version.as_str().to_string(),
             bifs,
             classes,
+            datasources,
             abi_major: d.abi_major,
             tier: d.tier,
         };

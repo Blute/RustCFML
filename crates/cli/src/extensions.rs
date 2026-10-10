@@ -51,6 +51,10 @@ pub struct Manifest {
     /// loading a single byte of native code.
     pub provides_bifs: Vec<String>,
     pub provides_classes: Vec<String>,
+    /// Database driver KINDS, as a datasource's `driver` key names them.
+    /// Declared here so two extensions claiming the same kind are caught
+    /// before either library is opened.
+    pub provides_datasources: Vec<String>,
     /// Exclusive capabilities (e.g. `"v8"`): the host refuses to load a second
     /// provider of the same one, because two extensions each initialising the
     /// same process-global runtime is a crash, not a conflict.
@@ -92,6 +96,7 @@ impl Manifest {
             description: s("description"),
             provides_bifs: list("bifs"),
             provides_classes: list("classes"),
+            provides_datasources: list("datasources"),
             exclusive: list("exclusive"),
             libraries,
         })
@@ -116,6 +121,7 @@ impl Manifest {
             "description": self.description,
             "bifs": self.provides_bifs,
             "classes": self.provides_classes,
+            "datasources": self.provides_datasources,
             "exclusive": self.exclusive,
             "libraries": libs,
         }))
@@ -421,6 +427,8 @@ pub fn load_all(dirs: &[PathBuf], cfg: &ExtensionsCfg) -> (Vec<Extension>, Vec<S
 
     // Conflict detection from manifests, before anything is loaded.
     let mut owner_of_bif: HashMap<String, String> = HashMap::new();
+    let mut owner_of_datasource: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
     let mut owner_of_exclusive: HashMap<String, String> = HashMap::new();
     let mut refused: Vec<String> = Vec::new();
     let mut candidates: Vec<&Candidate> = chosen.values().collect();
@@ -448,6 +456,19 @@ pub fn load_all(dirs: &[PathBuf], cfg: &ExtensionsCfg) -> (Vec<Extension>, Vec<S
                 ));
             }
             owner_of_bif.insert(key, m.name.clone());
+        }
+        // Two drivers for one kind is worse than two BIFs of a name: which one
+        // a datasource got would depend on load order, and the answer is a
+        // different DATABASE rather than a different function.
+        for ds in &m.provides_datasources {
+            let key = ds.to_lowercase();
+            if let Some(owner) = owner_of_datasource.get(&key) {
+                problems.push(format!(
+                    "datasource driver [{}] is provided by both [{}] and [{}]; the later one wins",
+                    ds, owner, m.name
+                ));
+            }
+            owner_of_datasource.insert(key, m.name.clone());
         }
     }
 
@@ -544,6 +565,7 @@ mod tests {
             description: "d".into(),
             provides_bifs: vec!["xOne".into()],
             provides_classes: vec!["X".into()],
+            provides_datasources: vec!["xdb".into()],
             exclusive: vec![],
             libraries,
         };

@@ -357,6 +357,95 @@ fn on_load(_ctx: &Ctx, settings: Value) -> Result<()> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// A database driver, written the way an extension author would write one
+// ---------------------------------------------------------------------------
+
+struct FakeDb {
+    /// Proves the instance is built once and reused, not rebuilt per call.
+    calls: AtomicI64,
+}
+
+struct FakeTxn {
+    statements: Vec<String>,
+    committed: bool,
+}
+
+impl rustcfml_module::DbTransaction for FakeTxn {
+    fn execute<'a>(
+        &mut self,
+        ctx: &'a Ctx,
+        sql: &str,
+        _params: Value<'a>,
+        _return_type: &str,
+    ) -> Result<Value<'a>> {
+        self.statements.push(sql.to_string());
+        Ok(ctx.int(self.statements.len() as i64))
+    }
+    fn commit(&mut self, _ctx: &Ctx) -> Result<()> {
+        self.committed = true;
+        Ok(())
+    }
+    fn rollback(&mut self, _ctx: &Ctx) -> Result<()> {
+        self.committed = false;
+        Ok(())
+    }
+}
+
+impl rustcfml_module::DbDriver for FakeDb {
+    const DRIVER: &'static str = "fakedb";
+
+    fn new(_ctx: &Ctx, _args: &[Value]) -> Result<Self> {
+        Ok(FakeDb { calls: AtomicI64::new(0) })
+    }
+
+    fn execute<'a>(
+        &self,
+        ctx: &'a Ctx,
+        sql: &str,
+        _params: Value<'a>,
+        _return_type: &str,
+    ) -> Result<Value<'a>> {
+        let n = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+        if sql.contains("BOOM") {
+            return Err(Error::expression("fake driver refused the statement"));
+        }
+        if sql.contains("PANIC") {
+            panic!("fake driver panicked");
+        }
+        let q = ctx.query(&["sql", "seq"])?;
+        let row = ctx.array();
+        row.push(ctx.string(sql))?;
+        row.push(ctx.int(n))?;
+        q.query_add_row(row)?;
+        Ok(q)
+    }
+
+    fn begin(&self, _ctx: &Ctx, _isolation: &str) -> Option<Result<Box<dyn rustcfml_module::DbTransaction>>> {
+        Some(Ok(Box::new(FakeTxn { statements: Vec::new(), committed: false })))
+    }
+
+    fn dbinfo<'a>(
+        &self,
+        ctx: &'a Ctx,
+        info_type: &str,
+        _attrs: Value<'a>,
+    ) -> Option<Result<Value<'a>>> {
+        // Answers `version` only; everything else declines so the engine's own
+        // handling runs — the subset a real driver is expected to start from.
+        if !info_type.eq_ignore_ascii_case("version") {
+            return None;
+        }
+        Some((|| {
+            let q = ctx.query(&["database_productname"])?;
+            let row = ctx.array();
+            row.push(ctx.string("FakeDB"))?;
+            q.query_add_row(row)?;
+            Ok(q)
+        })())
+    }
+}
+
 module! {
     name: "abitest",
     version: "9.9.9",
@@ -393,6 +482,7 @@ module! {
     classes: { Tally, Recurser },
     qoq_scalars: { "abiDouble" => sql_double },
     qoq_aggregates: { "abiTotal" => sql_total },
+    drivers: { FakeDb },
     on_load: on_load,
 }
 
@@ -431,6 +521,156 @@ fn the_declaration_is_adopted_with_everything_it_provides() {
     assert_eq!(m.bifs.len(), 27);
     assert_eq!(m.classes.len(), 2);
     assert_eq!(m.classes[0].0, "Tally");
+    assert_eq!(m.drivers.len(), 1);
+    assert_eq!(m.drivers[0].0, "fakedb");
+}
+
+// ---------------------------------------------------------------------------
+// Database drivers
+// ---------------------------------------------------------------------------
+
+/// `drivers`/`driver_count` were APPENDED to `ModuleDecl`. An extension
+/// compiled before they existed emits a SHORTER struct, so a host that read
+/// those fields unconditionally would read past the end of that module's
+/// static — silently, on a `.rcx` that is already published and works.
+///
+/// This fakes exactly that: a declaration whose `size` is the pre-change one,
+/// with deliberately unusable values in the new fields. Adopting it must not
+/// touch them. Without the `size` guard in `adopt` this test dereferences a
+/// bad pointer rather than failing politely, which is the point — the hazard
+/// is not something the type system catches.
+#[test]
+fn a_declaration_from_before_drivers_existed_is_not_read_past_its_end() {
+    use cfml_module_abi as abi;
+
+    // Everything up to and including `qoq_fn_count` is the original layout.
+    let legacy_size = std::mem::offset_of!(abi::ModuleDecl, qoq_fn_count)
+        + std::mem::size_of::<usize>();
+    assert!(
+        legacy_size < std::mem::size_of::<abi::ModuleDecl>(),
+        "this test is meaningless unless the struct actually grew"
+    );
+
+    let decl = abi::ModuleDecl {
+        size: legacy_size,
+        abi_major: abi::ABI_MAJOR,
+        tier: abi::tier::VALUES,
+        name: abi::StrRef::new("legacy"),
+        version: abi::StrRef::new("0.0.1"),
+        target: abi::StrRef::new(abi::TARGET),
+        on_load: None,
+        bifs: std::ptr::null(),
+        bif_count: 0,
+        classes: std::ptr::null(),
+        class_count: 0,
+        qoq_fns: std::ptr::null(),
+        qoq_fn_count: 0,
+        // Beyond `size`: a real legacy module has no such memory at all, so
+        // these stand in for whatever happens to follow its static.
+        drivers: usize::MAX as *const abi::DbDriverDecl,
+        driver_count: 99,
+    };
+
+    let m = unsafe { foreign::adopt(&decl, "legacy.rcx", CfmlValue::Null) }
+        .expect("a pre-drivers declaration must still load");
+    assert!(m.drivers.is_empty(), "fields past `size` must not be read");
+}
+
+
+/// Build the module's driver instance, as the host does once at load.
+fn driver() -> (foreign::LoadedModule, foreign::ForeignDbDriver, *mut std::ffi::c_void) {
+    let m = load();
+    let d = m.drivers[0].1;
+    let data = d.construct(Vec::new()).expect("driver should construct");
+    (m, d, data)
+}
+
+#[test]
+fn a_driver_executes_and_returns_a_query() {
+    let (_m, d, data) = driver();
+    let r = d
+        .execute(data, "select 1", &CfmlValue::Array(CfmlArray::new(Vec::new())), "query")
+        .expect("execute should succeed");
+    let q = match r {
+        CfmlValue::Query(q) => q,
+        other => panic!("expected a query, got {:?}", other),
+    };
+    assert_eq!(q.row_count(), 1);
+    assert_eq!(q.column_values_ci("sql").unwrap()[0].as_string(), "select 1");
+}
+
+#[test]
+fn the_driver_instance_is_built_once_and_reused() {
+    let (_m, d, data) = driver();
+    let params = CfmlValue::Array(CfmlArray::new(Vec::new()));
+    for expected in 1..=3 {
+        let r = d.execute(data, "select 1", &params, "query").unwrap();
+        let q = match r {
+            CfmlValue::Query(q) => q,
+            other => panic!("expected a query, got {:?}", other),
+        };
+        // The sequence number lives on the instance, so it only climbs if the
+        // same instance answered all three calls.
+        assert_eq!(q.column_values_ci("seq").unwrap()[0].as_string(), expected.to_string());
+    }
+}
+
+#[test]
+fn a_driver_error_becomes_a_cfml_error() {
+    let (_m, d, data) = driver();
+    let e = d
+        .execute(data, "BOOM", &CfmlValue::Array(CfmlArray::new(Vec::new())), "query")
+        .expect_err("the driver refused, so this must be an error");
+    assert!(e.message.contains("refused the statement"), "got: {}", e.message);
+}
+
+#[test]
+fn a_driver_panic_is_contained() {
+    let (_m, d, data) = driver();
+    let e = d
+        .execute(data, "PANIC", &CfmlValue::Array(CfmlArray::new(Vec::new())), "query")
+        .expect_err("a panic must surface as an error, not unwind into the engine");
+    assert!(e.message.contains("panicked"), "got: {}", e.message);
+}
+
+#[test]
+fn a_driver_transaction_runs_and_commits() {
+    let (_m, d, data) = driver();
+    assert!(d.supports_transactions());
+    let txn = d.begin(data, "").expect("begin should succeed");
+    let params = CfmlValue::Array(CfmlArray::new(Vec::new()));
+    let r = d.txn_execute(txn, "insert into t values (1)", &params, "query").unwrap();
+    assert_eq!(r.as_string(), "1");
+    let r = d.txn_execute(txn, "insert into t values (2)", &params, "query").unwrap();
+    assert_eq!(r.as_string(), "2");
+    d.txn_commit(txn).expect("commit should succeed");
+}
+
+#[test]
+fn a_driver_without_savepoints_refuses_them() {
+    let (_m, d, data) = driver();
+    // FakeTxn takes the `supports_savepoints` default, so a NESTED transaction
+    // must be refused rather than silently flattened into the outer one.
+    let txn = d.begin(data, "").unwrap();
+    let e = d
+        .txn_savepoint(txn, cfml_module_abi::savepoint_op::SET, "sp1")
+        .expect_err("savepoints are not supported, so this must fail");
+    assert!(e.message.contains("savepoint"), "got: {}", e.message);
+    d.txn_rollback(txn).unwrap();
+}
+
+#[test]
+fn dbinfo_answers_what_it_knows_and_declines_the_rest() {
+    let (_m, d, data) = driver();
+    let attrs = CfmlValue::strukt(Default::default());
+    match d.dbinfo(data, "version", &attrs).unwrap() {
+        CfmlValue::Query(q) => {
+            assert_eq!(q.column_values_ci("database_productname").unwrap()[0].as_string(), "FakeDB")
+        }
+        other => panic!("expected a query for type=version, got {:?}", other),
+    }
+    // Declining is a Null return, which the host reads as "you answer it".
+    assert!(matches!(d.dbinfo(data, "tables", &attrs).unwrap(), CfmlValue::Null));
 }
 
 #[test]

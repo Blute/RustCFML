@@ -1046,6 +1046,257 @@ impl ForeignClass {
 }
 
 // ---------------------------------------------------------------------------
+// ForeignDbDriver — a module's database driver, seen by the engine as a
+// datasource backend
+// ---------------------------------------------------------------------------
+
+/// A database driver provided by a loaded extension.
+///
+/// Holds only what is needed to construct and call one. Every crossing goes
+/// through [`with_call`], exactly as a BIF does, so panic containment, handle
+/// generations and the `throw`-staging error path are the same code — a driver
+/// cannot take the process down or return a stale handle.
+///
+/// The instance is built once, at load, and shared by every request; the module
+/// owns its own synchronisation (the `Send + Sync` contract on
+/// [`abi::DbDriverVtable`]).
+#[derive(Clone, Copy)]
+pub struct ForeignDbDriver {
+    pub ctor: abi::ClassCtorFn,
+    pub vtable: *const abi::DbDriverVtable,
+    pub module: &'static str,
+    pub name: &'static str,
+}
+
+unsafe impl Send for ForeignDbDriver {}
+unsafe impl Sync for ForeignDbDriver {}
+
+impl ForeignDbDriver {
+    fn label(&self, what: &str) -> String {
+        format!("{}:datasource:{}:{}", self.module, self.name, what)
+    }
+
+    /// Build the driver instance. `args` is the datasource's configuration.
+    /// The returned pointer is module-owned; [`Self::release`] frees it.
+    pub fn construct(&self, args: Vec<CfmlValue>) -> Result<*mut c_void, CfmlError> {
+        let ctor = self.ctor;
+        let label = self.label("construct");
+        let out = std::sync::Arc::new(std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()));
+        let sink = std::sync::Arc::clone(&out);
+        with_call(&|| label.clone(), None, args, move |raw, handles| unsafe {
+            let mut data: *mut c_void = std::ptr::null_mut();
+            let code = ctor(raw, handles.as_ptr(), handles.len(), &mut data);
+            if code != abi::status::OK || data.is_null() {
+                // The module already called throw(); returning NULL lets that
+                // error surface rather than masking it with a second one.
+                return ValueHandle::NULL;
+            }
+            sink.store(data, std::sync::atomic::Ordering::Release);
+            ValueHandle::NULL
+        })?;
+        let data = out.load(std::sync::atomic::Ordering::Acquire);
+        if data.is_null() {
+            return Err(CfmlError::database(format!(
+                "datasource driver [{}] failed to initialise",
+                self.name
+            )));
+        }
+        Ok(data)
+    }
+
+    /// Run one statement.
+    pub fn execute(
+        &self,
+        data: *mut c_void,
+        sql: &str,
+        params: &CfmlValue,
+        return_type: &str,
+    ) -> CfmlResult {
+        let vtable = self.vtable;
+        let label = self.label("execute");
+        let sql = sql.to_string();
+        let return_type = return_type.to_string();
+        let data = SendPtr(data);
+        with_call(
+            &|| label.clone(),
+            None,
+            vec![params.clone()],
+            move |raw, handles| unsafe {
+                ((*vtable).execute)(
+                    raw,
+                    data.0,
+                    abi::StrRef::new(&sql),
+                    handles.first().copied().unwrap_or(ValueHandle::NULL),
+                    abi::StrRef::new(&return_type),
+                )
+            },
+        )
+    }
+
+    /// `cfdbinfo`. `Ok(CfmlValue::Null)` means the driver declined this
+    /// `info_type` and the engine should answer it.
+    pub fn dbinfo(&self, data: *mut c_void, info_type: &str, attrs: &CfmlValue) -> CfmlResult {
+        let vtable = self.vtable;
+        let Some(f) = (unsafe { (*vtable).dbinfo }) else {
+            return Ok(CfmlValue::Null);
+        };
+        let label = self.label("dbinfo");
+        let info_type = info_type.to_string();
+        let data = SendPtr(data);
+        with_call(&|| label.clone(), None, vec![attrs.clone()], move |raw, handles| unsafe {
+            f(
+                raw,
+                data.0,
+                abi::StrRef::new(&info_type),
+                handles.first().copied().unwrap_or(ValueHandle::NULL),
+            )
+        })
+    }
+
+    /// Whether this driver declares transactions at all.
+    pub fn supports_transactions(&self) -> bool {
+        unsafe { (*self.vtable).begin.is_some() }
+    }
+
+    /// Whether its transactions declare savepoints — what decides whether a
+    /// NESTED `transaction { }` can be isolated.
+    pub fn supports_savepoints(&self) -> bool {
+        unsafe { (*self.vtable).txn_savepoint.is_some() }
+    }
+
+    /// Open a transaction, returning the module-owned handle.
+    pub fn begin(&self, data: *mut c_void, isolation: &str) -> Result<*mut c_void, CfmlError> {
+        let vtable = self.vtable;
+        let Some(f) = (unsafe { (*vtable).begin }) else {
+            return Err(CfmlError::database(format!(
+                "cftransaction: datasource [{}] is provided by a driver that does not support transactions",
+                self.name
+            )));
+        };
+        let label = self.label("begin");
+        let isolation = isolation.to_string();
+        let data = SendPtr(data);
+        let out = std::sync::Arc::new(std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()));
+        let sink = std::sync::Arc::clone(&out);
+        with_call(&|| label.clone(), None, Vec::new(), move |raw, _handles| unsafe {
+            let mut txn: *mut c_void = std::ptr::null_mut();
+            if f(raw, data.0, abi::StrRef::new(&isolation), &mut txn) == abi::status::OK
+                && !txn.is_null()
+            {
+                sink.store(txn, std::sync::atomic::Ordering::Release);
+            }
+            ValueHandle::NULL
+        })?;
+        let txn = out.load(std::sync::atomic::Ordering::Acquire);
+        if txn.is_null() {
+            return Err(CfmlError::database(format!(
+                "cftransaction: datasource [{}] could not open a transaction",
+                self.name
+            )));
+        }
+        Ok(txn)
+    }
+
+    /// Run a statement inside an open transaction.
+    pub fn txn_execute(
+        &self,
+        txn: *mut c_void,
+        sql: &str,
+        params: &CfmlValue,
+        return_type: &str,
+    ) -> CfmlResult {
+        let vtable = self.vtable;
+        let Some(f) = (unsafe { (*vtable).txn_execute }) else {
+            return Err(self.no_txn_verb("txn_execute"));
+        };
+        let label = self.label("txn_execute");
+        let sql = sql.to_string();
+        let return_type = return_type.to_string();
+        let txn = SendPtr(txn);
+        with_call(&|| label.clone(), None, vec![params.clone()], move |raw, handles| unsafe {
+            f(
+                raw,
+                txn.0,
+                abi::StrRef::new(&sql),
+                handles.first().copied().unwrap_or(ValueHandle::NULL),
+                abi::StrRef::new(&return_type),
+            )
+        })
+    }
+
+    pub fn txn_commit(&self, txn: *mut c_void) -> Result<(), CfmlError> {
+        self.txn_verb(txn, unsafe { (*self.vtable).txn_commit }, "commit")
+    }
+
+    pub fn txn_rollback(&self, txn: *mut c_void) -> Result<(), CfmlError> {
+        self.txn_verb(txn, unsafe { (*self.vtable).txn_rollback }, "rollback")
+    }
+
+    fn txn_verb(
+        &self,
+        txn: *mut c_void,
+        f: Option<unsafe extern "C-unwind" fn(*mut abi::Ctx, *mut c_void) -> u32>,
+        what: &str,
+    ) -> Result<(), CfmlError> {
+        let Some(f) = f else {
+            return Err(self.no_txn_verb(what));
+        };
+        let label = self.label(what);
+        let txn = SendPtr(txn);
+        with_call(&|| label.clone(), None, Vec::new(), move |raw, _h| unsafe {
+            f(raw, txn.0);
+            ValueHandle::NULL
+        })
+        .map(|_| ())
+    }
+
+    /// Savepoint verb. `op` is one of `abi::savepoint_op`.
+    pub fn txn_savepoint(
+        &self,
+        txn: *mut c_void,
+        op: u32,
+        name: &str,
+    ) -> Result<(), CfmlError> {
+        let Some(f) = (unsafe { (*self.vtable).txn_savepoint }) else {
+            return Err(CfmlError::database(format!(
+                "cftransaction: datasource [{}] does not support savepoints, so a nested \
+                 transaction cannot be isolated from the one around it",
+                self.name
+            )));
+        };
+        let label = self.label("savepoint");
+        let name = name.to_string();
+        let txn = SendPtr(txn);
+        with_call(&|| label.clone(), None, Vec::new(), move |raw, _h| unsafe {
+            f(raw, txn.0, op, abi::StrRef::new(&name));
+            ValueHandle::NULL
+        })
+        .map(|_| ())
+    }
+
+    fn no_txn_verb(&self, what: &str) -> CfmlError {
+        CfmlError::database(format!(
+            "cftransaction: datasource [{}] opened a transaction but provides no {}",
+            self.name, what
+        ))
+    }
+
+    /// Release the instance.
+    pub fn release(&self, data: *mut c_void) {
+        if !data.is_null() {
+            unsafe { ((*self.vtable).drop_fn)(data) };
+        }
+    }
+}
+
+/// A raw pointer moved into a `with_call` closure. The closure runs to
+/// completion inside that call and the pointer is module-owned for the whole
+/// process, so there is nothing to race on.
+#[derive(Clone, Copy)]
+struct SendPtr(*mut c_void);
+unsafe impl Send for SendPtr {}
+
+// ---------------------------------------------------------------------------
 // ForeignNative — a module's class, seen by the engine as an ordinary native
 // ---------------------------------------------------------------------------
 
@@ -1261,6 +1512,10 @@ pub struct LoadedModule {
     /// SQL functions usable inside `queryExecute(…, {dbtype:"query"})`.
     /// `true` in the second slot means aggregate.
     pub qoq_fns: Vec<(String, ForeignBuiltin, bool)>,
+    /// Datasources the extension backs, by name. The host turns each into a
+    /// `cfml_stdlib::DynamicDbDriver` — done in `cli`, not here, because
+    /// `cfml-vm`'s dependency on `cfml-stdlib` is optional.
+    pub drivers: Vec<(String, ForeignDbDriver)>,
     /// A directory of CFML the extension ships, mounted as `/<name>/`. Set by
     /// the loader after extraction; the ABI knows nothing about it.
     pub cfml_dir: Option<std::path::PathBuf>,
@@ -1363,6 +1618,49 @@ pub unsafe fn adopt(
         }
     }
 
+    // Drivers were APPENDED to `ModuleDecl`. An extension compiled before they
+    // existed emits a shorter struct, so reading `d.drivers`/`d.driver_count`
+    // unconditionally would read past the end of that module's static. The
+    // declaration carries its own `size` for exactly this; everything above is
+    // in the original layout and needs no check.
+    let decl_has = |byte_offset: usize| d.size >= byte_offset + std::mem::size_of::<usize>();
+    let mut drivers: Vec<(String, ForeignDbDriver)> = Vec::new();
+    if decl_has(std::mem::offset_of!(abi::ModuleDecl, driver_count)) && !d.drivers.is_null() {
+        for i in 0..d.driver_count {
+            let dd = &*d.drivers.add(i);
+            if dd.vtable.is_null() {
+                return Err(format!(
+                    "{}: datasource driver '{}' has a null vtable",
+                    source,
+                    dd.name.as_str()
+                ));
+            }
+            // `begin` without the verbs that drive a transaction would leave a
+            // half-open transaction the engine could never commit. Refuse the
+            // whole extension rather than load it in that state.
+            let v = &*dd.vtable;
+            if v.begin.is_some()
+                && (v.txn_execute.is_none() || v.txn_commit.is_none() || v.txn_rollback.is_none())
+            {
+                return Err(format!(
+                    "{}: datasource driver '{}' declares begin() but not all of \
+                     txn_execute/txn_commit/txn_rollback",
+                    source,
+                    dd.name.as_str()
+                ));
+            }
+            drivers.push((
+                dd.name.as_str().to_string(),
+                ForeignDbDriver {
+                    ctor: dd.ctor,
+                    vtable: dd.vtable,
+                    module: leak(&name_str),
+                    name: leak(dd.name.as_str()),
+                },
+            ));
+        }
+    }
+
     // on_load: once per process. Given a real ctx so config can be delivered as
     // an ordinary struct handle rather than a second marshalling scheme.
     if let Some(on_load) = d.on_load {
@@ -1396,6 +1694,7 @@ pub unsafe fn adopt(
         bifs,
         classes,
         qoq_fns,
+        drivers,
         cfml_dir: None,
     })
 }

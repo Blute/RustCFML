@@ -38,6 +38,58 @@ pub trait DynamicDbDriver: Send + Sync + 'static {
         params_arg: &CfmlValue,
         return_type: &str,
     ) -> CfmlResult;
+
+    /// Open a transaction. The default refuses, which is what a driver that
+    /// has not implemented transactions should do — and keeps every existing
+    /// implementation compiling unchanged.
+    ///
+    /// `isolation` is `<cftransaction isolation="...">`, empty when unset.
+    fn begin(&self, _isolation: &str) -> Result<Box<dyn DynamicTransaction>, CfmlError> {
+        Err(dynamic_tx_unsupported("this datasource"))
+    }
+
+    /// Answer a `cfdbinfo` request. `None` declines and lets the engine's own
+    /// metadata handling run, so a driver can answer `version`/`tables`/
+    /// `columns` and ignore the rest.
+    fn dbinfo(&self, _info_type: &str, _attrs: &CfmlValue) -> Option<CfmlResult> {
+        None
+    }
+}
+
+/// An open transaction owned by a [`DynamicDbDriver`].
+///
+/// Object-safe on purpose: the engine holds it as `Box<dyn DynamicTransaction>`
+/// inside the same type-erased slot the bundled drivers use, which is why
+/// nothing in `cfml-vm` has to know a dynamic driver exists — nesting,
+/// deferred BEGIN and multi-datasource transactions all keep working.
+pub trait DynamicTransaction: Send + 'static {
+    fn execute(&mut self, sql: &str, params_arg: &CfmlValue, return_type: &str) -> CfmlResult;
+    fn commit(&mut self) -> Result<(), CfmlError>;
+    fn rollback(&mut self) -> Result<(), CfmlError>;
+
+    /// Whether this transaction can take savepoints. `false` makes a NESTED
+    /// `transaction { }` an error rather than letting it silently flatten into
+    /// the outer one and commit work the inner block meant to roll back.
+    fn supports_savepoints(&self) -> bool {
+        false
+    }
+    fn savepoint(&mut self, _name: &str) -> Result<(), CfmlError> {
+        Err(savepoints_unsupported())
+    }
+    fn release_savepoint(&mut self, _name: &str) -> Result<(), CfmlError> {
+        Err(savepoints_unsupported())
+    }
+    fn rollback_to_savepoint(&mut self, _name: &str) -> Result<(), CfmlError> {
+        Err(savepoints_unsupported())
+    }
+}
+
+fn savepoints_unsupported() -> CfmlError {
+    CfmlError::database(
+        "cftransaction: this datasource's driver does not support savepoints, so a nested \
+         transaction cannot be isolated from the one around it"
+            .to_string(),
+    )
 }
 
 static DYNAMIC_DRIVERS: OnceLock<Mutex<HashMap<String, Arc<dyn DynamicDbDriver>>>> =
@@ -78,7 +130,9 @@ pub fn has_dynamic_datasource(name: &str) -> bool {
 
 /// Helper for cftransaction: produce a uniform "not supported" error.
 pub fn dynamic_tx_unsupported(name: &str) -> CfmlError {
-    CfmlError::runtime(format!(
+    // `database`-typed, not `runtime`: Lucee/ACF raise a catchable `database`
+    // exception for datasource problems and application probes rely on it.
+    CfmlError::database(format!(
         "cftransaction: datasource '{}' is provided by a dynamic driver that does not yet support transactions",
         name
     ))

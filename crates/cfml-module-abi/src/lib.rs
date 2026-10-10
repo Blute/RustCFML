@@ -228,6 +228,103 @@ pub struct NativeClassVtable {
     pub drop_fn: unsafe extern "C" fn(data: *mut c_void),
 }
 
+/// The method table for a module-provided **database driver** (§4.7).
+///
+/// The host implements `cfml_stdlib::DynamicDbDriver` over this, so a datasource
+/// backed by an extension reaches `queryExecute`, `<cfquery>`, `cftransaction`
+/// and `cfdbinfo` through exactly the paths a bundled driver uses.
+///
+/// Only `execute` is required. Every other entry is `Option`: a driver that
+/// leaves `begin` null reports "transactions not supported" the way the engine
+/// already does for a dynamic datasource, and one that leaves `dbinfo` null
+/// falls through to the built-in metadata handling. A driver therefore starts
+/// useful and grows, rather than having to implement all of it to load.
+///
+/// **`Send + Sync` is asserted by contract**, as for [`NativeClassVtable`]: the
+/// module owns its own synchronisation. A datasource is shared by every request.
+#[repr(C)]
+pub struct DbDriverVtable {
+    pub size: usize,
+    /// Run one statement. `params` is an Array handle of already-normalised
+    /// values (the host flattens `cfqueryparam` structs before calling), and
+    /// `return_type` is `"query"`, `"array"` or `"struct:<columnKey>"`.
+    pub execute: unsafe extern "C-unwind" fn(
+        ctx: *mut Ctx,
+        data: *mut c_void,
+        sql: StrRef,
+        params: ValueHandle,
+        return_type: StrRef,
+    ) -> ValueHandle,
+    /// Open a transaction, writing an opaque module-owned handle through `out`.
+    /// Null means this driver has no transactions.
+    pub begin: Option<
+        unsafe extern "C-unwind" fn(
+            ctx: *mut Ctx,
+            data: *mut c_void,
+            isolation: StrRef,
+            out: *mut *mut c_void,
+        ) -> u32,
+    >,
+    /// Run a statement inside the transaction `txn`. Required when `begin` is set.
+    pub txn_execute: Option<
+        unsafe extern "C-unwind" fn(
+            ctx: *mut Ctx,
+            txn: *mut c_void,
+            sql: StrRef,
+            params: ValueHandle,
+            return_type: StrRef,
+        ) -> ValueHandle,
+    >,
+    /// Commit and release `txn`. Required when `begin` is set.
+    pub txn_commit: Option<unsafe extern "C-unwind" fn(ctx: *mut Ctx, txn: *mut c_void) -> u32>,
+    /// Roll back and release `txn`. Required when `begin` is set.
+    pub txn_rollback: Option<unsafe extern "C-unwind" fn(ctx: *mut Ctx, txn: *mut c_void) -> u32>,
+    /// Savepoint verbs. `op` is one of [`savepoint_op`]. Null means the driver
+    /// has no savepoints, which makes a NESTED `transaction { }` an error
+    /// instead of silently flattening into the outer one.
+    pub txn_savepoint: Option<
+        unsafe extern "C-unwind" fn(
+            ctx: *mut Ctx,
+            txn: *mut c_void,
+            op: u32,
+            name: StrRef,
+        ) -> u32,
+    >,
+    /// `cfdbinfo`. `attrs` is a Struct handle of the tag's attributes. Return
+    /// [`ValueHandle::NULL`] with [`status::OK`] to decline a particular
+    /// `info_type` and let the engine answer.
+    pub dbinfo: Option<
+        unsafe extern "C-unwind" fn(
+            ctx: *mut Ctx,
+            data: *mut c_void,
+            info_type: StrRef,
+            attrs: ValueHandle,
+        ) -> ValueHandle,
+    >,
+    /// Release the driver instance. Called when the host drops it.
+    pub drop_fn: unsafe extern "C" fn(data: *mut c_void),
+}
+
+/// `op` values for [`DbDriverVtable::txn_savepoint`].
+pub mod savepoint_op {
+    pub const SET: u32 = 0;
+    pub const RELEASE: u32 = 1;
+    pub const ROLLBACK_TO: u32 = 2;
+}
+
+/// One database driver a module provides.
+///
+/// `name` is the driver KIND, as a datasource's `driver` key names it. The
+/// manifest declares it too, so two extensions claiming the same kind are
+/// caught before either is loaded. `ctor` is called once per datasource
+/// configured with that kind, receiving its settings.
+#[repr(C)]
+pub struct DbDriverDecl {
+    pub name: StrRef,
+    pub ctor: ClassCtorFn,
+    pub vtable: *const DbDriverVtable,
+}
+
 /// One BIF a module provides.
 #[repr(C)]
 pub struct BifDecl {
@@ -280,6 +377,11 @@ pub struct ModuleDecl {
     pub class_count: usize,
     pub qoq_fns: *const QoqFnDecl,
     pub qoq_fn_count: usize,
+    /// Database drivers. APPENDED — a host reading this must check `size`
+    /// first, because an extension compiled before these existed emits a
+    /// shorter struct and these two fields are then past the end of it.
+    pub drivers: *const DbDriverDecl,
+    pub driver_count: usize,
 }
 
 // A ModuleDecl is built from statics in the module and only ever read by the
@@ -289,6 +391,8 @@ unsafe impl Sync for BifDecl {}
 unsafe impl Sync for ClassDecl {}
 unsafe impl Sync for QoqFnDecl {}
 unsafe impl Sync for NativeClassVtable {}
+unsafe impl Sync for DbDriverDecl {}
+unsafe impl Sync for DbDriverVtable {}
 
 /// The symbol the loader looks for.
 pub const DECL_SYMBOL: &[u8] = b"rustcfml_module_decl";

@@ -741,6 +741,175 @@ unsafe extern "C" fn vt_drop<C: NativeClass>(data: *mut c_void) {
     }
 }
 
+// ---- database-driver shims ------------------------------------------------
+
+/// Stage `e` as the pending host error and return a failure status.
+unsafe fn raise(raw: *mut abi::Ctx, e: &Error) -> u32 {
+    (host().throw)(
+        raw,
+        e.kind,
+        StrRef::new(&e.custom_type),
+        StrRef::new(&e.message),
+        ValueHandle::NULL,
+    );
+    1
+}
+
+unsafe extern "C-unwind" fn drv_execute<D: DbDriver>(
+    raw: *mut abi::Ctx,
+    data: *mut c_void,
+    sql: StrRef,
+    params: ValueHandle,
+    return_type: StrRef,
+) -> ValueHandle {
+    let ctx = Ctx::from_raw(raw);
+    let this = &*(data as *const D);
+    let p = Value { h: params, ctx: &ctx };
+    finish(&ctx, this.execute(&ctx, sql.as_str(), p, return_type.as_str()))
+}
+
+unsafe extern "C-unwind" fn drv_begin<D: DbDriver>(
+    raw: *mut abi::Ctx,
+    data: *mut c_void,
+    isolation: StrRef,
+    out: *mut *mut c_void,
+) -> u32 {
+    let ctx = Ctx::from_raw(raw);
+    let this = &*(data as *const D);
+    match this.begin(&ctx, isolation.as_str()) {
+        // The decl only advertises `begin` when D overrides it, so reaching
+        // here with None means the driver changed its mind at runtime.
+        None => raise(raw, &Error::new("this driver does not support transactions")),
+        Some(Err(e)) => raise(raw, &e),
+        Some(Ok(txn)) => {
+            *out = Box::into_raw(Box::new(txn)) as *mut c_void;
+            abi::status::OK
+        }
+    }
+}
+
+unsafe extern "C-unwind" fn drv_txn_execute<D: DbDriver>(
+    raw: *mut abi::Ctx,
+    txn: *mut c_void,
+    sql: StrRef,
+    params: ValueHandle,
+    return_type: StrRef,
+) -> ValueHandle {
+    let ctx = Ctx::from_raw(raw);
+    let t = &mut *(txn as *mut Box<dyn DbTransaction>);
+    let p = Value { h: params, ctx: &ctx };
+    finish(&ctx, t.execute(&ctx, sql.as_str(), p, return_type.as_str()))
+}
+
+unsafe extern "C-unwind" fn drv_txn_commit<D: DbDriver>(
+    raw: *mut abi::Ctx,
+    txn: *mut c_void,
+) -> u32 {
+    let ctx = Ctx::from_raw(raw);
+    let mut t = Box::from_raw(txn as *mut Box<dyn DbTransaction>);
+    match t.commit(&ctx) {
+        Ok(()) => abi::status::OK,
+        Err(e) => raise(raw, &e),
+    }
+}
+
+unsafe extern "C-unwind" fn drv_txn_rollback<D: DbDriver>(
+    raw: *mut abi::Ctx,
+    txn: *mut c_void,
+) -> u32 {
+    let ctx = Ctx::from_raw(raw);
+    let mut t = Box::from_raw(txn as *mut Box<dyn DbTransaction>);
+    match t.rollback(&ctx) {
+        Ok(()) => abi::status::OK,
+        Err(e) => raise(raw, &e),
+    }
+}
+
+unsafe extern "C-unwind" fn drv_txn_savepoint<D: DbDriver>(
+    raw: *mut abi::Ctx,
+    txn: *mut c_void,
+    op: u32,
+    name: StrRef,
+) -> u32 {
+    let ctx = Ctx::from_raw(raw);
+    let t = &mut *(txn as *mut Box<dyn DbTransaction>);
+    if !t.supports_savepoints() {
+        return raise(raw, &Error::new("this driver does not support savepoints"));
+    }
+    let r = match op {
+        abi::savepoint_op::SET => t.savepoint(&ctx, name.as_str()),
+        abi::savepoint_op::RELEASE => t.release_savepoint(&ctx, name.as_str()),
+        _ => t.rollback_to_savepoint(&ctx, name.as_str()),
+    };
+    match r {
+        Ok(()) => abi::status::OK,
+        Err(e) => raise(raw, &e),
+    }
+}
+
+unsafe extern "C-unwind" fn drv_dbinfo<D: DbDriver>(
+    raw: *mut abi::Ctx,
+    data: *mut c_void,
+    info_type: StrRef,
+    attrs: ValueHandle,
+) -> ValueHandle {
+    let ctx = Ctx::from_raw(raw);
+    let this = &*(data as *const D);
+    let a = Value { h: attrs, ctx: &ctx };
+    match this.dbinfo(&ctx, info_type.as_str(), a) {
+        // Declining is OK + NULL; the engine then answers it itself.
+        None => ValueHandle::NULL,
+        Some(r) => finish(&ctx, r),
+    }
+}
+
+unsafe extern "C" fn drv_drop<D: DbDriver>(data: *mut c_void) {
+    if !data.is_null() {
+        drop(Box::from_raw(data as *mut D));
+    }
+}
+
+/// Constructor shim for a driver — same shape as [`internal::class_ctor`].
+#[doc(hidden)]
+pub unsafe extern "C-unwind" fn driver_ctor<D: DbDriver>(
+    raw: *mut abi::Ctx,
+    args: *const ValueHandle,
+    argc: usize,
+    out: *mut *mut c_void,
+) -> u32 {
+    let ctx = Ctx::from_raw(raw);
+    internal::with_args(&ctx, args, argc, |values| match D::new(&ctx, values) {
+        Ok(instance) => {
+            *out = Box::into_raw(Box::new(instance)) as *mut c_void;
+            abi::status::OK
+        }
+        Err(e) => raise(raw, &e),
+    })
+}
+
+/// Holder for the per-driver method table — see [`Vt`] for why this is an
+/// associated `const` rather than a `static`.
+pub struct DrvVt<D>(core::marker::PhantomData<D>);
+
+impl<D: DbDriver> DrvVt<D> {
+    pub const TABLE: abi::DbDriverVtable = abi::DbDriverVtable {
+        size: core::mem::size_of::<abi::DbDriverVtable>(),
+        execute: drv_execute::<D>,
+        begin: Some(drv_begin::<D>),
+        txn_execute: Some(drv_txn_execute::<D>),
+        txn_commit: Some(drv_txn_commit::<D>),
+        txn_rollback: Some(drv_txn_rollback::<D>),
+        txn_savepoint: Some(drv_txn_savepoint::<D>),
+        dbinfo: Some(drv_dbinfo::<D>),
+        drop_fn: drv_drop::<D>,
+    };
+}
+
+/// The `#[repr(C)]` driver table for `D`, with process lifetime.
+pub const fn driver_vtable<D: DbDriver>() -> *const abi::DbDriverVtable {
+    &DrvVt::<D>::TABLE
+}
+
 /// Holder for the per-class method table.
 ///
 /// An associated `const` can be generic where a `static` cannot, and a table of
@@ -763,6 +932,95 @@ impl<C: NativeClass> Vt<C> {
 /// The `#[repr(C)]` method table for `C`, with process lifetime.
 pub const fn class_vtable<C: NativeClass>() -> *const abi::NativeClassVtable {
     &Vt::<C>::TABLE
+}
+
+// ---------------------------------------------------------------------------
+// Database drivers
+// ---------------------------------------------------------------------------
+
+/// A database backend an extension provides, reached as an ordinary datasource.
+///
+/// Implement [`Self::execute`] and the datasource works with `queryExecute`,
+/// `<cfquery>`, `cfqueryparam`, every return type and `maxrows`. The rest is
+/// optional and each piece is independent: implement [`Self::begin`] to get
+/// `transaction { }`, [`Self::dbinfo`] to answer `<cfdbinfo>`. Leave one out
+/// and the engine reports it as unsupported rather than guessing.
+///
+/// One instance is built at load and shared by every request, so it is
+/// `Send + Sync` and owns its own synchronisation.
+pub trait DbDriver: Send + Sync + Sized + 'static {
+    /// The driver KIND this backs, as a datasource's `driver` key names it —
+    /// `"greptimedb"`, not the name of one particular datasource.
+    ///
+    /// Every datasource configured with this `driver` gets its own instance,
+    /// built with that datasource's settings. The kind is also usable as a
+    /// datasource name directly, so `datasource="greptimedb"` works with no
+    /// configuration at all for the simple case.
+    const DRIVER: &'static str;
+
+    /// Build the driver. `args[0]` is the datasource's configuration as a
+    /// struct — `host`, `port`, `database`, `username`, `password`,
+    /// `connectionString` and anything else that was declared — or an empty
+    /// struct when the engine is building the kind's default datasource.
+    fn new(ctx: &Ctx, args: &[Value]) -> Result<Self>;
+
+    /// Run one statement. `params` is an array of already-normalised values —
+    /// the engine flattens `cfqueryparam` structs first — and `return_type` is
+    /// `"query"`, `"array"` or `"struct:<columnKey>"`.
+    fn execute<'a>(
+        &self,
+        ctx: &'a Ctx,
+        sql: &str,
+        params: Value<'a>,
+        return_type: &str,
+    ) -> Result<Value<'a>>;
+
+    /// Open a transaction. `None` — the default — means this driver has none,
+    /// and `transaction { }` against it reports that rather than silently
+    /// running the statements unprotected.
+    fn begin(&self, _ctx: &Ctx, _isolation: &str) -> Option<Result<Box<dyn DbTransaction>>> {
+        None
+    }
+
+    /// Answer a `<cfdbinfo type="...">`. `None` declines, so a driver can
+    /// answer `version`/`tables`/`columns` and let the engine handle the rest.
+    fn dbinfo<'a>(
+        &self,
+        _ctx: &'a Ctx,
+        _info_type: &str,
+        _attrs: Value<'a>,
+    ) -> Option<Result<Value<'a>>> {
+        None
+    }
+}
+
+/// An open transaction belonging to a [`DbDriver`].
+pub trait DbTransaction: Send + 'static {
+    fn execute<'a>(
+        &mut self,
+        ctx: &'a Ctx,
+        sql: &str,
+        params: Value<'a>,
+        return_type: &str,
+    ) -> Result<Value<'a>>;
+    fn commit(&mut self, ctx: &Ctx) -> Result<()>;
+    fn rollback(&mut self, ctx: &Ctx) -> Result<()>;
+
+    /// Whether savepoints work. `false` — the default — makes a NESTED
+    /// `transaction { }` an error instead of letting it flatten into the outer
+    /// one and commit work the inner block meant to roll back.
+    fn supports_savepoints(&self) -> bool {
+        false
+    }
+    fn savepoint(&mut self, _ctx: &Ctx, _name: &str) -> Result<()> {
+        Err(Error::new("this driver does not support savepoints"))
+    }
+    fn release_savepoint(&mut self, _ctx: &Ctx, _name: &str) -> Result<()> {
+        Err(Error::new("this driver does not support savepoints"))
+    }
+    fn rollback_to_savepoint(&mut self, _ctx: &Ctx, _name: &str) -> Result<()> {
+        Err(Error::new("this driver does not support savepoints"))
+    }
 }
 
 
@@ -1182,6 +1440,7 @@ macro_rules! module {
         $(, classes: { $( $class:ty ),* $(,)? } )?
         $(, qoq_scalars: { $( $qs_name:literal => $qs_fn:path ),* $(,)? } )?
         $(, qoq_aggregates: { $( $qa_name:literal => $qa_fn:path ),* $(,)? } )?
+        $(, drivers: { $( $driver:ty ),* $(,)? } )?
         $(, on_load: $on_load:path )?
         $(,)?
     ) => {
@@ -1206,6 +1465,20 @@ macro_rules! module {
                         }
                         $crate::internal::bif_shim::<Shim> as $crate::abi::ModuleFn
                     },
+                }
+            ),* )?
+        ];
+
+        #[doc(hidden)]
+        static __RUSTCFML_DRIVERS: &[$crate::abi::DbDriverDecl] = &[
+            $( $(
+                $crate::abi::DbDriverDecl {
+                    name: $crate::abi::StrRef::new(
+                        <$driver as $crate::DbDriver>::DRIVER,
+                    ),
+                    ctor: $crate::driver_ctor::<$driver>
+                        as $crate::abi::ClassCtorFn,
+                    vtable: $crate::driver_vtable::<$driver>(),
                 }
             ),* )?
         ];
@@ -1306,6 +1579,8 @@ macro_rules! module {
             class_count: __RUSTCFML_CLASSES.len(),
             qoq_fns: __RUSTCFML_QOQ.as_ptr(),
             qoq_fn_count: __RUSTCFML_QOQ.len(),
+            drivers: __RUSTCFML_DRIVERS.as_ptr(),
+            driver_count: __RUSTCFML_DRIVERS.len(),
         };
 
         /// The symbol the loader resolves.

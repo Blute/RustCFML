@@ -451,6 +451,81 @@ registered as ordinary BIFs, so `slugify( "…" )` works from CFML too.
 An extension's SQL function is never assumed pure, so it is not hoisted out of a
 row loop: it may read a scope or call CFML.
 
+## Database drivers
+
+An extension can back a **datasource**, so a database RustCFML does not bundle
+reaches `queryExecute`, `<cfquery>`, `cfqueryparam`, `transaction { }` and
+`<cfdbinfo>` through the paths every other datasource uses:
+
+```rust
+use rustcfml_module::{module, Ctx, DbDriver, Result, Value};
+
+struct Greptime { /* a client, a pool, whatever it needs */ }
+
+impl DbDriver for Greptime {
+    // The driver KIND, as a datasource's `driver` key names it.
+    const DRIVER: &'static str = "greptimedb";
+
+    fn new( ctx: &Ctx, args: &[Value] ) -> Result<Self> {
+        // args[0] is the datasource's settings: host, port, database, …
+        Ok( Greptime { } )
+    }
+
+    fn execute<'a>( &self, ctx: &'a Ctx, sql: &str, params: Value<'a>, return_type: &str )
+        -> Result<Value<'a>>
+    {
+        let q = ctx.query( &[ "id", "name" ] )?;
+        // … run the statement, add a row per result …
+        Ok( q )
+    }
+}
+
+module! {
+    name: "greptime",
+    version: "0.1.0",
+    drivers: { Greptime },
+}
+```
+
+```cfml
+// Configured, with its own settings — any number of them:
+this.datasources.metrics = { driver = "greptimedb", host = "…", database = "…" };
+queryExecute( "select * from cpu", [], { datasource = "metrics" } );
+
+// Or straight away, with no configuration, under the driver's own name:
+queryExecute( "select * from cpu", [], { datasource = "greptimedb" } );
+```
+
+`params` arrives as an array of plain values — the engine flattens
+`cfqueryparam` structs first — and `return_type` is `"query"`, `"array"` or
+`"struct:<columnKey>"`. **Build the result with the engine's own helpers**
+rather than by hand: `build_query_result_columnar`, `build_mutation_result` and
+`dedup_result_columns` are what give a bundled driver its Lucee-shaped
+`{recordCount, sql, executionTime, generatedKey}` and its duplicate-column
+collapse, and hand-rolling those is how a driver quietly diverges.
+
+**Everything past `execute` is optional, and each piece is independent.**
+Implement `begin` and `transaction { }` works; leave it out and a transaction
+against that datasource says so rather than silently running the statements
+unprotected. Implement `dbinfo` and `<cfdbinfo>` works; decline an individual
+`type=` by returning `None` and the engine answers it. A driver that only
+answers `version`, `tables` and `columns` is a reasonable place to stop — those
+are what ORMs actually call.
+
+If your transactions have no savepoints, leave `supports_savepoints` at its
+default. A **nested** `transaction { }` then errors instead of flattening into
+the one around it and committing work the inner block meant to roll back.
+
+Two drivers claiming the same kind is reported before either library is opened,
+because the kind is declared in `module.json` — the same pre-load conflict check
+that covers BIFs and classes.
+
+A driver instance is built once and shared by every request, so it is
+`Send + Sync` and owns its own synchronisation. It is also the one place the
+`ctx` is not inside a request: a driver gets tier-1 values and cannot read
+scopes or call CFML, which is what you want from something a connection pool
+calls.
+
 ## Shipping CFML with an extension
 
 A `.rcx` can carry a `cfml/` directory, which the engine mounts as

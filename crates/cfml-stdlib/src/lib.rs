@@ -28,6 +28,8 @@ pub mod s3_service;
 
 pub use builtins::*;
 pub use db_driver::{
-    DynamicDbDriver, has_dynamic_datasource, lookup_dynamic_datasource,
+    DynamicDbDriver, DynamicTransaction, has_dynamic_datasource, lookup_dynamic_datasource,
     register_dynamic_datasource, unregister_dynamic_datasource,
 };
+/// Result shaping, for drivers supplied by an extension — see `db_driver`.
+pub use builtins::{build_mutation_result, build_query_result_columnar, dedup_result_columns};

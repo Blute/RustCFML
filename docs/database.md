@@ -13,6 +13,12 @@ RustCFML runs parameterized queries via `queryExecute` (and the `<cfquery>` tag)
 | **PostgreSQL** | `postgres` (TLS via rustls) | `postgres_db` | See [Working with PostgreSQL](#working-with-postgresql) below. On Cloudflare Workers, reached via **Hyperdrive** (see below). |
 | **Microsoft SQL Server** | `tiberius` (TLS via rustls) | `mssql_db` | Also covers Azure SQL — connections are encrypted by default. See [Working with SQL Server](#working-with-sql-server). |
 
+**An extension can add an engine of its own.** A `.rcx` that declares a driver
+backs a datasource exactly as the bundled ones do — `queryExecute`,
+`<cfquery>`, `cfqueryparam`, `transaction { }` and `<cfdbinfo>` all route to it,
+and a datasource names it with `driver = "<kind>"`. See
+**[Extensions → Database drivers](extensions.md#database-drivers)**.
+
 Drivers are feature-gated so unused subsystems compile out. SQLite is on by default; enable the others at build time:
 
 ```bash

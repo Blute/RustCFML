@@ -56,6 +56,27 @@ pub fn fn_dbinfo_impl(args: Vec<CfmlValue>) -> CfmlResult {
             )
         })?,
     };
+    // A datasource backed by an extension answers for itself. Asked first,
+    // because `parse_datasource` below has no variant for one: it falls through
+    // its catch-all and classifies the name as a SQLite FILE, which made
+    // cfdbinfo emit SQLite pragma SQL at a foreign database. A driver may
+    // decline an individual `type=` (returning `None`), and then the engine's
+    // own handling runs — so answering `version`/`tables`/`columns` and
+    // ignoring the rest is a supported place to start.
+    if let Some(name) = attr("datasource") {
+        if let Some(driver) = crate::db_driver::lookup_dynamic_datasource(&name) {
+            if let Some(answer) = driver.dbinfo(&info_type, args.first().unwrap_or(&CfmlValue::Null))
+            {
+                return answer;
+            }
+            return Err(CfmlError::database(format!(
+                "cfdbinfo: datasource [{}] is provided by an extension whose driver does not \
+                 answer type [{}]",
+                name, info_type
+            )));
+        }
+    }
+
     let driver = parse_datasource(&ds);
     if let DbDriver::Unsupported(sub) = &driver {
         return Err(crate::builtins::unsupported_jdbc_driver_error(sub));

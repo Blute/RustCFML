@@ -15366,6 +15366,9 @@ enum TransactionConn {
     Postgres(r2d2::PooledConnection<PostgresConnectionManager>),
     #[cfg(feature = "mssql_db")]
     Mssql(r2d2::PooledConnection<MssqlConnectionManager>),
+    /// A transaction owned by an extension-supplied driver. Deliberately NOT
+    /// feature-gated — a build with no bundled driver can still have one.
+    Dynamic(Box<dyn crate::db_driver::DynamicTransaction>),
 }
 
 // ---- Public wrappers using Box<dyn Any> for VM interop ----
@@ -15373,8 +15376,13 @@ enum TransactionConn {
 /// Begin a transaction — returns a type-erased connection in a Box<dyn Any>
 #[cfg(any(feature = "sqlite", feature = "mysql_db", feature = "postgres_db", feature = "mssql_db"))]
 pub fn txn_begin_boxed(datasource: &str) -> Result<Box<dyn std::any::Any>, CfmlError> {
-    if crate::db_driver::has_dynamic_datasource(datasource) {
-        return Err(crate::db_driver::dynamic_tx_unsupported(datasource));
+    // An extension-supplied driver owns its own transaction. If it has not
+    // implemented one, `begin` is the thing that says so — the refusal moved
+    // from here into the trait's default so a driver that DOES support
+    // transactions is not blocked by a blanket check.
+    if let Some(driver) = crate::db_driver::lookup_dynamic_datasource(datasource) {
+        let txn = driver.begin("")?;
+        return Ok(Box::new(TransactionConn::Dynamic(txn)));
     }
     // Resolve the NAME the same way the query path does. `parse_datasource`
     // treats an unregistered bare name as a SQLite FILE, so a transaction on a
@@ -15479,6 +15487,7 @@ fn transaction_begin(datasource: &str) -> Result<TransactionConn, CfmlError> {
 #[cfg(any(feature = "sqlite", feature = "mysql_db", feature = "postgres_db", feature = "mssql_db"))]
 fn transaction_commit(conn: &mut TransactionConn) -> Result<(), CfmlError> {
     match conn {
+        TransactionConn::Dynamic(t) => t.commit(),
         #[cfg(feature = "sqlite")]
         TransactionConn::Sqlite(c) => {
             c.execute_batch("COMMIT")
@@ -15523,6 +15532,7 @@ fn transaction_commit(conn: &mut TransactionConn) -> Result<(), CfmlError> {
 #[cfg(any(feature = "sqlite", feature = "mysql_db", feature = "postgres_db", feature = "mssql_db"))]
 fn transaction_rollback(conn: &mut TransactionConn) -> Result<(), CfmlError> {
     match conn {
+        TransactionConn::Dynamic(t) => t.rollback(),
         #[cfg(feature = "sqlite")]
         TransactionConn::Sqlite(c) => {
             c.execute_batch("ROLLBACK")
@@ -15605,6 +15615,11 @@ enum SavepointOp {
 #[cfg(any(feature = "sqlite", feature = "mysql_db", feature = "postgres_db", feature = "mssql_db"))]
 fn transaction_savepoint(conn: &mut TransactionConn, op: SavepointOp, name: &str) -> Result<(), CfmlError> {
     match conn {
+        TransactionConn::Dynamic(t) => match op {
+            SavepointOp::Create => t.savepoint(name),
+            SavepointOp::Release => t.release_savepoint(name),
+            SavepointOp::RollbackTo => t.rollback_to_savepoint(name),
+        },
         #[cfg(feature = "sqlite")]
         TransactionConn::Sqlite(c) => {
             let sql = match op {
@@ -15676,6 +15691,7 @@ fn execute_with_transaction(conn: &mut TransactionConn, sql: &str, params_arg: &
     let sql = sql.as_str();
     let params_arg = &params_arg;
     match conn {
+        TransactionConn::Dynamic(t) => t.execute(sql, params_arg, return_type),
         #[cfg(feature = "sqlite")]
         TransactionConn::Sqlite(c) => {
             execute_sqlite_with_conn(c, sql, params_arg, return_type)
@@ -15839,8 +15855,12 @@ fn execute_postgres_with_conn(conn: &mut PgConn, sql: &str, params_arg: &CfmlVal
 /// source column position each should read from. With no duplicates the source
 /// positions are simply `0..n`, so the row-building loop is unchanged in the
 /// common case; only a genuinely duplicated result pays the collapse.
-#[cfg(any(feature = "sqlite", feature = "mysql_db", feature = "postgres_db", feature = "mssql_db"))]
-fn dedup_result_columns(raw: Vec<String>) -> (Vec<String>, Vec<usize>) {
+// Public and ungated: an extension-supplied driver needs these to return the
+// shapes CFML expects, and such a build may carry none of the bundled drivers.
+// Hand-rolling them is how a third-party driver quietly loses Lucee parity —
+// `cfml-worker`'s Hyperdrive driver reimplemented all three and does not match
+// the column dedup.
+pub fn dedup_result_columns(raw: Vec<String>) -> (Vec<String>, Vec<usize>) {
     let mut names: Vec<String> = Vec::with_capacity(raw.len());
     let mut keep: Vec<usize> = Vec::with_capacity(raw.len());
     for (i, name) in raw.into_iter().enumerate() {
@@ -15853,13 +15873,16 @@ fn dedup_result_columns(raw: Vec<String>) -> (Vec<String>, Vec<usize>) {
     (names, keep)
 }
 
-#[cfg(any(feature = "sqlite", feature = "mysql_db", feature = "postgres_db", feature = "mssql_db"))]
 /// [`build_query_result`] for column-major cells (`data[col][row]`, every
 /// column the same length). The default query return type adopts the columns as
 /// they are; the row-shaped return types build each row struct from keys made
 /// once per column.
-#[cfg(any(feature = "sqlite", feature = "mysql_db", feature = "postgres_db", feature = "mssql_db"))]
-fn build_query_result_columnar(
+// Public and ungated: an extension-supplied driver needs these to return the
+// shapes CFML expects, and such a build may carry none of the bundled drivers.
+// Hand-rolling them is how a third-party driver quietly loses Lucee parity —
+// `cfml-worker`'s Hyperdrive driver reimplemented all three and does not match
+// the column dedup.
+pub fn build_query_result_columnar(
     columns: Vec<String>,
     data: Vec<Vec<CfmlValue>>,
     sql: &str,
@@ -15935,7 +15958,6 @@ fn build_query_result(columns: Vec<String>, rows: Vec<ValueMap>, sql: &str, retu
 /// kind that carries a generated key — Lucee omits `generatedKey` for
 /// UPDATE/DELETE/DDL, and drivers report a stale id from the previous
 /// INSERT for those).
-#[cfg(any(feature = "sqlite", feature = "mysql_db", feature = "postgres_db", feature = "mssql_db"))]
 fn sql_is_insert(sql: &str) -> bool {
     sql.trim_start()
         .get(..6)
@@ -15947,8 +15969,12 @@ fn sql_is_insert(sql: &str) -> bool {
 /// exposes through cfquery's `result=` attribute / queryExecute's `result`
 /// option: {recordCount, cached, sql, executionTime [, generatedKey]} —
 /// `generatedKey` only on an INSERT that actually inserted rows.
-#[cfg(any(feature = "sqlite", feature = "mysql_db", feature = "postgres_db", feature = "mssql_db"))]
-fn build_mutation_result(affected: i64, last_id: i64, sql: &str) -> CfmlResult {
+// Public and ungated: an extension-supplied driver needs these to return the
+// shapes CFML expects, and such a build may carry none of the bundled drivers.
+// Hand-rolling them is how a third-party driver quietly loses Lucee parity —
+// `cfml-worker`'s Hyperdrive driver reimplemented all three and does not match
+// the column dedup.
+pub fn build_mutation_result(affected: i64, last_id: i64, sql: &str) -> CfmlResult {
     let mut result = ValueMap::default();
     result.insert("recordCount".to_string(), CfmlValue::Int(affected));
     result.insert("cached".to_string(), CfmlValue::Bool(false));
