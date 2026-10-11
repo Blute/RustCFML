@@ -714,6 +714,10 @@ include "harness.cfm";
 <cf_runtest file="tags/test_throw_object_rootcause.cfm" />
 <cf_runtest file="tags/test_cfloop_file_and_includes.cfm" />
 <cf_runtest file="tags/test_tags_cfhttp_multipart.cfm" />
+<!--- - cfhttpparam_binary_body: <cfhttpparam type="body" value="#binary#"> must --->
+<!--- send the bytes as the raw request body, as Lucee does (presigned S3/R2 --->
+<!--- PUT uploads); RustCFML sends the string "<Binary>" in their place. --->
+<cf_runtest file="tags/test_cfhttpparam_binary_body.cfm" />
 <cf_runtest file="tags/test_cfhttp_timeout_interpolation.cfm" />
 <cf_runtest file="tags/test_cfexecute_interpolation.cfm" />
 <cf_runtest file="tags/test_tag_attribute_interpolation_sweep.cfm" />
