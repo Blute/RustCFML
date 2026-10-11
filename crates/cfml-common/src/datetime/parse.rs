@@ -94,8 +94,140 @@ pub fn expand_two_digit_year(y: i32) -> i32 {
     }
 }
 
-/// Parse Lucee's dot-separated date forms: `A.B.C`, optionally followed by a
-/// time (`5.3.2 10:30:00`).
+/// A time of day, read the way Lucee reads one.
+///
+/// Grammar: `H:MM[:SS[.fff]]` with an optional trailing AM/PM marker — `am`,
+/// `pm`, or the bare initials `a`/`p`, in any case, with any amount of space
+/// (including none) before it. Returns the time and how many days it carries
+/// into the next date.
+///
+/// The meridiem is **not** a 12-hour hour constraint. Lucee parses whatever
+/// hour is written and then folds it, so hours outside 1–12 are accepted and
+/// transformed rather than rejected — probed on Lucee 7.1.0.204:
+///
+/// | input | Lucee | input | Lucee |
+/// |---|---|---|---|
+/// | `12:30 AM` | 00:30 | `0:30 PM` | 12:30 |
+/// | `12:30 PM` | 12:30 | `13:30 AM` | 01:30 |
+/// | `0:30 AM` | 00:30 | `13:30 PM` | 13:30 |
+/// | `11:59 pm` | 23:59 | `23:30 AM` | 11:30 |
+/// | `12:30p` | 12:30 | `23:30 PM` | 23:30 |
+///
+/// So the hour is `h % 12`, plus 12 for PM. Writing `%I` formats instead (which
+/// is what we did) rejects every right-hand column outright, and that is the
+/// shape of GH #489: `isValid("time", …)` had its own private format list that
+/// accepted `12:30 AM`, while the parser behind `timeFormat()`/`parseDateTime()`
+/// had no `%I:%M %p` entry at all — so the same string validated and then
+/// failed to format.
+///
+/// Hour 24 is accepted and rolls into the next day (`24:00` is
+/// `{ts '1899-12-31 00:00:00'}` on Lucee, `1/2/2020 24:00` is the 3rd). With a
+/// meridiem it folds to 12 rather than to 0, which is why it is called out
+/// separately below — `24:00 AM` is noon and `24:00 PM` is the next midnight.
+/// Hour 25 is rejected, as are minutes or seconds above 59.
+fn parse_time_of_day(s: &str) -> Option<(NaiveTime, i64)> {
+    let s = s.trim();
+
+    // The meridiem marker, if any. It must follow a DIGIT so that a stray
+    // trailing letter cannot be eaten off a word — otherwise "2 Sep" would
+    // offer "2 Se" to the rest of this function.
+    let (body, meridiem) = match strip_meridiem(s) {
+        Some((rest, pm)) => (rest, Some(pm)),
+        None => (s, None),
+    };
+
+    let mut parts = body.split(':');
+    let hour: i64 = digits(parts.next()?, 2)?;
+    let minute: i64 = digits(parts.next()?, 2)?;
+    let (second, nanos) = match parts.next() {
+        Some(sec) => {
+            let (whole, frac) = match sec.split_once('.') {
+                Some((w, f)) => (w, Some(f)),
+                None => (sec, None),
+            };
+            let nanos = match frac {
+                // Lucee reads ".5" as half a second, so the fraction is a
+                // PADDED field, not an integer. Kept to the nanosecond: the
+                // request's `datePrecision` decides what is read back out of
+                // it (GH #479), and truncating here to milliseconds would make
+                // a nanosecond-precision request silently lossy.
+                Some(f) if !f.is_empty() && f.bytes().all(|c| c.is_ascii_digit()) => {
+                    let mut p = String::from(f);
+                    p.truncate(9);
+                    while p.len() < 9 { p.push('0'); }
+                    p.parse::<i64>().ok()?
+                }
+                Some(_) => return None,
+                None => 0,
+            };
+            (digits(whole, 2)?, nanos)
+        }
+        None => (0, 0),
+    };
+    if parts.next().is_some() { return None; }
+    if hour > 24 || minute > 59 || second > 59 { return None; }
+
+    let (hour, days) = match meridiem {
+        // `24` folds to 12, not to 0 — so AM is noon and PM is the next
+        // midnight. Every other hour folds by `% 12`.
+        Some(pm) => {
+            let h = if hour == 24 { 12 } else { hour % 12 } + if pm { 12 } else { 0 };
+            if h >= 24 { (h - 24, 1) } else { (h, 0) }
+        }
+        None if hour == 24 => (0, 1),
+        None => (hour, 0),
+    };
+
+    let t = NaiveTime::from_hms_nano_opt(
+        u32::try_from(hour).ok()?,
+        u32::try_from(minute).ok()?,
+        u32::try_from(second).ok()?,
+        u32::try_from(nanos).ok()?,
+    )?;
+    Some((t, days))
+}
+
+/// Split a trailing `am`/`pm`/`a`/`p` marker off a time. The character before
+/// it must be a digit, which is what keeps this from biting into a word.
+fn strip_meridiem(s: &str) -> Option<(&str, bool)> {
+    for (marker, pm) in [("am", false), ("pm", true), ("a", false), ("p", true)] {
+        let Some(rest) = s
+            .len()
+            .checked_sub(marker.len())
+            .and_then(|i| Some((s.get(..i)?, s.get(i..)?)))
+            .filter(|(_, tail)| tail.eq_ignore_ascii_case(marker))
+            .map(|(head, _)| head.trim_end())
+        else { continue };
+        if rest.ends_with(|c: char| c.is_ascii_digit()) {
+            return Some((rest, pm));
+        }
+    }
+    None
+}
+
+/// A 1-or-`max`-digit field, digits only.
+fn digits(s: &str, max: usize) -> Option<i64> {
+    if s.is_empty() || s.len() > max || !s.bytes().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    s.parse().ok()
+}
+
+/// Split a string into its date and time halves at the separator before the
+/// first `:`. Lucee composes any date form with any time form, so splitting
+/// once here is what lets `2020-01-02T12:30 AM`, `Jan 2 2020 12:30 AM` and
+/// `1.2.2020 12:30AM` all work without a format-table entry each.
+fn split_date_time(s: &str) -> Option<(&str, &str)> {
+    let colon = s.find(':')?;
+    let (cut, sep) = s[..colon]
+        .char_indices()
+        .rev()
+        .find(|(_, c)| c.is_whitespace() || *c == 'T')?;
+    Some((s[..cut].trim_end(), &s[cut + sep.len_utf8()..]))
+}
+
+/// Parse Lucee's dot-separated date forms: `A.B.C`. A trailing time is split
+/// off before this is reached.
 ///
 /// Which of A/B/C is the day, month and year is decided positionally, exactly as
 /// Lucee decides it — verified against Lucee 7.1.0 across 35 probes:
@@ -119,13 +251,8 @@ pub fn expand_two_digit_year(y: i32) -> i32 {
 /// a date cast, and `5.3.2` is 3 May 2002. It is not a version-string rule — the
 /// acceptance set tracks date validity exactly, leap years included (`2.29.2004`
 /// passes, `2.29.2005` does not).
-fn parse_dotted_date(s: &str) -> Option<NaiveDateTime> {
-    let (date_part, time_part) = match s.split_once(char::is_whitespace) {
-        Some((d, t)) => (d, t.trim()),
-        None => (s, ""),
-    };
-
-    let mut parts = date_part.split('.');
+fn parse_dotted_date(s: &str) -> Option<NaiveDate> {
+    let mut parts = s.split('.');
     let (a, b, c) = (parts.next()?, parts.next()?, parts.next()?);
     if parts.next().is_some() {
         return None; // four or more components is not a date on either engine
@@ -145,21 +272,45 @@ fn parse_dotted_date(s: &str) -> Option<NaiveDateTime> {
         (c, a, b)
     };
 
-    let date = NaiveDate::from_ymd_opt(
+    NaiveDate::from_ymd_opt(
         expand_two_digit_year(year),
         u32::try_from(month).ok()?,
         u32::try_from(day).ok()?,
-    )?;
+    )
+}
 
-    if time_part.is_empty() {
-        return date.and_hms_opt(0, 0, 0);
-    }
-    for fmt in &["%H:%M:%S", "%I:%M:%S %p", "%H:%M", "%I:%M %p"] {
-        if let Ok(t) = NaiveTime::parse_from_str(time_part, fmt) {
-            return Some(date.and_time(t));
+/// A date with no time of day, in any of the forms Lucee accepts.
+fn parse_date_only(s: &str) -> Option<NaiveDate> {
+    for fmt in &[
+        "%Y-%m-%d",
+        // Slash-separated ISO order — `2020/1/2`, which Lucee parses (and
+        // `isDate()`/`isValid("date",…)` accept) but we used to reject while
+        // accepting the dashed form. Unambiguous against `%m/%d/%Y` below: a
+        // leading 4-digit year can't be a month, and a leading month can't be
+        // a year with a valid day left over.
+        "%Y/%m/%d",
+        "%m/%d/%Y",
+        "%m-%d-%Y",
+        "%d %b %Y",
+        "%b %d, %Y",
+        "%B %d, %Y",
+        "%d-%b-%Y",
+        // Month-name forms without a comma (Lucee/ACF accept these) — e.g.
+        // "January 1 1970", used by cbsecurity's JwtService epoch base.
+        "%B %d %Y",
+        "%b %d %Y",
+        // Month-comma order (GH #365): Lucee's own serializeJSON writes
+        // "August, 25 2026", with the comma after the MONTH.
+        "%B, %d %Y",
+        "%b, %d %Y",
+    ] {
+        if let Ok(d) = NaiveDate::parse_from_str(s, fmt) {
+            return Some(d);
         }
     }
-    None
+    // Dot-separated dates — `5.3.2`, `31.12.2020`, `2020.11.5`. Lucee parses
+    // these; we rejected them outright (GH #411).
+    parse_dotted_date(s)
 }
 
 /// Central date parser: ODBC literals, ISO 8601, common US/EU forms, dotted
@@ -173,50 +324,9 @@ pub fn parse(s: &str) -> Option<Parsed> {
         return parse_odbc_literal(s);
     }
 
-    // DateTime formats (most specific first). `%.f` optionally consumes a
-    // fractional-seconds component (".177"), so the fractional variants also
-    // match values with no fraction.
-    for fmt in &[
-        "%Y-%m-%dT%H:%M:%S%.f",
-        "%Y-%m-%d %H:%M:%S%.f",
-        "%Y-%m-%d %H:%M:%S",
-        "%Y-%m-%dT%H:%M:%S",
-        "%Y-%m-%d %H:%M",
-        // Slash-separated ISO order — `2020/1/2`, which Lucee parses (and
-        // `isDate()`/`isValid("date",…)` accept) but we used to reject while
-        // accepting the dashed form. Unambiguous against `%m/%d/%Y` below: a
-        // leading 4-digit year can't be a month, and a leading month can't be
-        // a year with a valid day left over.
-        "%Y/%m/%d %H:%M:%S",
-        "%Y/%m/%d %H:%M",
-        "%m/%d/%Y %H:%M:%S",
-        "%m/%d/%Y %I:%M:%S %p",
-        "%m/%d/%Y %I:%M %p",
-        "%m/%d/%Y %H:%M",
-        "%d %b %Y %H:%M:%S",
-        "%b %d, %Y %H:%M:%S",
-        "%B %d, %Y %H:%M:%S",
-        "%d-%b-%Y %H:%M:%S",
-        // Month-name forms without a comma (Lucee/ACF accept these) — e.g.
-        // "January 1 1970 00:00", used by cbsecurity's JwtService epoch base.
-        "%B %d %Y %H:%M:%S",
-        "%b %d %Y %H:%M:%S",
-        "%B %d %Y %H:%M",
-        "%b %d %Y %H:%M",
-        // Lucee's own serializeJSON date form, offset-less variant:
-        // "August, 25 2026 09:00:14". The comma sits after the MONTH here, not
-        // after the day, so none of the "%B %d, %Y" patterns above match it.
-        // See the offset-bearing variant just below (GH #365).
-        "%B, %d %Y %H:%M:%S",
-        "%b, %d %Y %H:%M:%S",
-        "%B, %d %Y %H:%M",
-        "%b, %d %Y %H:%M",
-    ] {
-        if let Ok(dt) = NaiveDateTime::parse_from_str(s, fmt) {
-            return Some(Parsed::Local(dt));
-        }
-    }
-
+    // Offset-bearing forms are read whole, ahead of the date/time split below:
+    // their time half carries a trailing "+0000" or "Z" that is not a time.
+    //
     // Lucee's serializeJSON date form WITH the trailing UTC offset:
     // `serializeJSON({d: createDateTime(2026,8,25,9,0,14)})` emits
     // {"D":"August, 25 2026 09:00:14 +0000"} on Lucee 7.0.5, and Lucee's date
@@ -225,46 +335,10 @@ pub fn parse(s: &str) -> Option<Parsed> {
     // switching engines — isDate() false, dateDiff "Invalid date2" (GH #365).
     // Our own serializeJSON writes "yyyy-mm-dd HH:mm:ss", which both engines
     // parse, so the gap is one-directional and this is the recovering half.
-    // Wall-clock fields as written, matching the RFC 3339 branch below.
     for fmt in &["%B, %d %Y %H:%M:%S %z", "%b, %d %Y %H:%M:%S %z"] {
         if let Ok(dt) = chrono::DateTime::parse_from_str(s, fmt) {
             // An absolute instant: the request zone applies only when it is read.
             return Some(Parsed::Instant(dt.naive_utc()));
-        }
-    }
-
-    // Date-only formats → midnight
-    for fmt in &[
-        "%Y-%m-%d",
-        "%Y/%m/%d",
-        "%m/%d/%Y",
-        "%m-%d-%Y",
-        "%d %b %Y",
-        "%b %d, %Y",
-        "%B %d, %Y",
-        "%d-%b-%Y",
-        "%B %d %Y",
-        "%b %d %Y",
-        // Month-comma order, date only (GH #365 — see the datetime list above).
-        "%B, %d %Y",
-        "%b, %d %Y",
-    ] {
-        if let Ok(d) = NaiveDate::parse_from_str(s, fmt) {
-            return d.and_hms_opt(0, 0, 0).map(Parsed::Local);
-        }
-    }
-
-    // Dot-separated dates — `5.3.2`, `31.12.2020`, `2020.11.5`, with an optional
-    // trailing time. Lucee parses these; we rejected them outright (GH #411).
-    if let Some(dt) = parse_dotted_date(s) {
-        return Some(Parsed::Local(dt));
-    }
-
-    // Time-only → Lucee's base date 1899-12-30 (`parseDateTime("10:20:30")`
-    // is `{ts '1899-12-30 10:20:30'}` on Lucee 7.1).
-    for fmt in &["%H:%M:%S%.f", "%I:%M:%S %p", "%H:%M"] {
-        if let Ok(t) = NaiveTime::parse_from_str(s, fmt) {
-            return time_base().map(|d| Parsed::Local(d.and_time(t)));
         }
     }
 
@@ -283,6 +357,33 @@ pub fn parse(s: &str) -> Option<Parsed> {
     // `parse_cfml_datetime_utc` remains the accessor for the absolute instant.
     if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
         return Some(Parsed::Instant(dt.naive_utc()));
+    }
+
+    // A date and a time. Lucee composes ANY date form with ANY time form, so
+    // this splits the string once and parses the halves, rather than carrying a
+    // format entry per combination — which is how an AM/PM time came to be
+    // readable after `%m/%d/%Y` and nowhere else (GH #489).
+    if let Some((date_part, time_part)) = split_date_time(s) {
+        if let (Some(date), Some((time, days))) =
+            (parse_date_only(date_part), parse_time_of_day(time_part))
+        {
+            return chrono::Duration::try_days(days)
+                .and_then(|d| date.checked_add_signed(d))
+                .map(|d| Parsed::Local(d.and_time(time)));
+        }
+    }
+
+    // Time-only → Lucee's base date 1899-12-30 (`parseDateTime("10:20:30")`
+    // is `{ts '1899-12-30 10:20:30'}` on Lucee 7.1).
+    if let Some((time, days)) = parse_time_of_day(s) {
+        return time_base()
+            .and_then(|b| chrono::Duration::try_days(days).and_then(|d| b.checked_add_signed(d)))
+            .map(|b| Parsed::Local(b.and_time(time)));
+    }
+
+    // A date on its own → midnight.
+    if let Some(d) = parse_date_only(s) {
+        return d.and_hms_opt(0, 0, 0).map(Parsed::Local);
     }
 
     // Date serial number (days since 1899-12-30, OLE Automation date)

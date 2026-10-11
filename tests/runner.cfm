@@ -296,6 +296,7 @@ include "harness.cfm";
 <cf_runtest file="stdlib/test_string_index_scans.cfm" />
 <cf_runtest file="stdlib/test_date_functions.cfm" />
 <cf_runtest file="stdlib/test_dotted_dates.cfm" />
+<cf_runtest file="stdlib/test_gh489_ampm_times.cfm" />
 <cf_runtest file="stdlib/test_timezone.cfm" />
 <cf_runtest file="stdlib/test_list_functions.cfm" />
 <cf_runtest file="stdlib/test_list_rest_literal_remainder.cfm" />

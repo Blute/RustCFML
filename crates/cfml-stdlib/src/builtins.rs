@@ -5010,13 +5010,11 @@ fn fn_is_date(args: Vec<CfmlValue>) -> CfmlResult {
     if !t.is_empty() && t.parse::<f64>().is_ok() {
         return Ok(CfmlValue::Bool(false));
     }
-    // Lucee treats a bare time-of-day ("6:15 PM", "18:15") as a valid date (it
-    // resolves to today at that time). isValid("date"/"datetime") routes here, and
-    // Wheels' automatic SQLite datetime validation does validatesFormatOf type="date".
-    let is_time = ["%H:%M", "%H:%M:%S", "%I:%M %p", "%I:%M:%S %p"]
-        .iter()
-        .any(|fmt| NaiveTime::parse_from_str(t, fmt).is_ok());
-    Ok(CfmlValue::Bool(is_time || parse_cfml_date(&s).is_some()))
+    // A bare time-of-day ("6:15 PM", "18:15") is a date on both engines, on
+    // Lucee's 1899-12-30 base. The parser reads those, so this asks it rather
+    // than keeping a second format list beside it — the two drifting apart is
+    // GH #489, where "12:30 AM" validated here and then failed to format.
+    Ok(CfmlValue::Bool(parse_cfml_date(&s).is_some()))
 }
 
 fn fn_is_query(args: Vec<CfmlValue>) -> CfmlResult {
@@ -5426,11 +5424,7 @@ fn fn_is_valid(args: Vec<CfmlValue>) -> CfmlResult {
                 let s = value.as_string();
                 let s = s.trim();
                 let is_numeric = !s.is_empty() && s.parse::<f64>().is_ok();
-                let ok = (!is_numeric && parse_cfml_date(s).is_some())
-                    || ["%H:%M", "%H:%M:%S", "%I:%M %p", "%I:%M:%S %p"]
-                        .iter()
-                        .any(|fmt| NaiveTime::parse_from_str(s, fmt).is_ok());
-                Ok(CfmlValue::Bool(ok))
+                Ok(CfmlValue::Bool(!is_numeric && parse_cfml_date(s).is_some()))
             }
             "array" => fn_is_array(vec![value.clone()]),
             "struct" => fn_is_struct(vec![value.clone()]),
