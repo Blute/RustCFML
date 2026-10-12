@@ -399,9 +399,17 @@ static EXTENSION_DRIVERS: OnceLock<Vec<(String, cfml_vm::foreign::ForeignDbDrive
 
 /// A datasource's settings, as the struct a driver's constructor receives.
 #[cfg(not(target_arch = "wasm32"))]
-fn datasource_cfg_as_struct(ds: &cfml_config::schema::DatasourceCfg) -> cfml_common::dynamic::CfmlValue {
+fn datasource_cfg_as_struct(
+    name: &str,
+    ds: &cfml_config::schema::DatasourceCfg,
+) -> cfml_common::dynamic::CfmlValue {
     use cfml_common::dynamic::CfmlValue;
     let mut m = cfml_common::dynamic::ValueMap::default();
+    // `name` first: a driver that backs SEVERAL datasources of its kind needs
+    // to know which one it is being built for — to label its errors, and to
+    // key anything it exposes alongside the datasource (a BIF addressing it by
+    // the name the CFML author used). The constructor had no way to learn it.
+    m.insert("name".to_string(), CfmlValue::string(name.to_string()));
     for (k, v) in [
         ("driver", ds.driver.as_str()),
         ("class", ds.class.as_str()),
@@ -411,9 +419,22 @@ fn datasource_cfg_as_struct(ds: &cfml_config::schema::DatasourceCfg) -> cfml_com
         ("username", ds.username.as_str()),
         ("password", ds.password.as_str()),
         ("connectionString", ds.connection_string.as_str()),
+        ("timezone", ds.timezone.as_str()),
     ] {
         if !v.is_empty() {
             m.insert(k.to_string(), CfmlValue::string(v.to_string()));
+        }
+    }
+    // The pool-shaping numbers. A driver brings its own pool (the engine's is
+    // per-bundled-driver and private), so without these it has to guess at a
+    // size the operator already declared.
+    for (k, v) in [
+        ("connectionLimit", i64::from(ds.connection_limit)),
+        ("connectionTimeout", i64::from(ds.connection_timeout)),
+        ("idleTimeout", i64::from(ds.idle_timeout)),
+    ] {
+        if v > 0 {
+            m.insert(k.to_string(), CfmlValue::Int(v));
         }
     }
     CfmlValue::strukt(m)
@@ -4424,19 +4445,33 @@ fn populate_datasource_registry(cfg: &RustCfmlConfig) {
         .and_then(|p| p.parent())
         .map(std::path::Path::to_path_buf);
     for (name, ds) in cfg.datasources.iter() {
-        if let Some(url) = ds.connection_url_anchored(base_dir.as_deref()) {
+        // An extension's driver kind is offered the datasource FIRST, because
+        // `connection_url` returns a URL for anything carrying a
+        // `connectionString` whatever its driver — so a `duckdb` datasource
+        // that declared one was handed to the bundled drivers, fell through
+        // their catch-all, and was opened as a SQLite file named after the
+        // connection string. It answered `select 1` and was the wrong
+        // database. Bundled kinds keep their existing route, so an extension
+        // cannot quietly take over `mysql`.
+        if !ds.is_bundled_driver()
+            && bind_extension_datasource(
+                name,
+                &ds.canonical_driver(),
+                datasource_cfg_as_struct(name, ds),
+            )
+        {
+            if ds.default {
+                cfml_stdlib::builtins::set_default_datasource(name.to_string());
+            }
+        } else if let Some(url) = ds.connection_url_anchored(base_dir.as_deref()) {
             cfml_stdlib::builtins::register_datasource(name, url.clone());
             cfml_stdlib::builtins::register_datasource_timeout(&url, ds.connection_timeout);
             if ds.default {
                 cfml_stdlib::builtins::set_default_datasource(url);
             }
-        } else if bind_extension_datasource(name, &ds.canonical_driver(), datasource_cfg_as_struct(ds)) {
-            // An extension supplies this driver kind; it owns the datasource
-            // from here, including its own connection handling.
-            if ds.default {
-                cfml_stdlib::builtins::set_default_datasource(name.to_string());
-            }
         } else {
+            // Every extension kind was offered this datasource above, so there
+            // is nothing left to try.
             log::warn!(
                 "cfconfig datasource '{}': unrecognised driver '{}'; skipping",
                 name,

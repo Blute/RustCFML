@@ -691,6 +691,22 @@ impl DatasourceCfg {
     /// aliased from Lucee's `type`/`dbdriver`) or, failing that, a JDBC `class`
     /// name. Lucee/ACF apps declare drivers as `type:"MySQL"` or via the JDBC
     /// driver class; both normalise to the same ids the URL builder understands.
+    /// Is this driver one the engine itself implements?
+    ///
+    /// An extension-supplied kind must be routed to its extension BEFORE the
+    /// connection-string shortcut in [`Self::connection_url`], which returns a
+    /// URL for ANY datasource that declares one and so would hand `driver =
+    /// "duckdb"` to the bundled drivers. There the URL is unrecognised, falls
+    /// through the catch-all, and is opened as a SQLite file literally named
+    /// after the connection string — a datasource that appears to work (the
+    /// engine answers `select 1`) and is the wrong database.
+    pub fn is_bundled_driver(&self) -> bool {
+        matches!(
+            self.canonical_driver().as_str(),
+            "mysql" | "mariadb" | "postgresql" | "postgres" | "mssql" | "sqlserver" | "sqlite"
+        )
+    }
+
     pub fn canonical_driver(&self) -> String {
         let raw = if !self.driver.is_empty() {
             &self.driver
@@ -1980,5 +1996,37 @@ mod tests {
         assert_eq!(ds.username, "app");
         std::env::remove_var("RUSTCFML_TEST_HOST_VAL");
         std::env::remove_var("RUSTCFML_TEST_USER_VAL");
+    }
+
+    #[test]
+    fn an_extension_driver_is_not_a_bundled_one_however_it_is_configured() {
+        // `connection_url` returns a URL for ANY datasource carrying a
+        // `connectionString`, whatever its driver. The registration order in
+        // `populate_datasource_registry` relies on this predicate to offer the
+        // datasource to its extension FIRST — without it, a `duckdb`
+        // datasource that declared a connection string was handed to the
+        // bundled drivers, fell through their catch-all and was opened as a
+        // SQLite file named after the connection string. It answered
+        // `select 1` and was the wrong database.
+        let mut ds = DatasourceCfg::default();
+        ds.driver = "duckdb".into();
+        ds.connection_string = "duckdb:/data/w.duckdb?threads=4".into();
+        assert!(!ds.is_bundled_driver());
+        assert!(
+            ds.connection_url().is_some(),
+            "the connection string still produces a URL — which is the trap"
+        );
+
+        // The bundled kinds keep their own route, so an extension cannot
+        // quietly take over `mysql` by declaring that kind.
+        for bundled in ["mysql", "MariaDB", "postgresql", "postgres", "mssql", "sqlserver", "sqlite"] {
+            let mut b = DatasourceCfg::default();
+            b.driver = bundled.into();
+            assert!(b.is_bundled_driver(), "{bundled} should be bundled");
+        }
+        // Including when named by JDBC class rather than by id.
+        let mut c = DatasourceCfg::default();
+        c.class = "org.postgresql.Driver".into();
+        assert!(c.is_bundled_driver());
     }
 }

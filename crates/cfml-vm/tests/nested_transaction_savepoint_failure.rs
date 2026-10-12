@@ -27,8 +27,23 @@ use std::sync::Arc;
 const VROOT: &str = "/app";
 
 /// What the stub driver was told to do, in order.
+///
+/// The stub hooks are plain `fn` pointers, so their bookkeeping has to be
+/// process-global — which means the tests in this file cannot run at the same
+/// time as each other. `cargo test` runs them in parallel by default, and one
+/// test resetting the counters mid-way through another reads as a failure in
+/// whichever lost the race. Each test takes this gate first.
 static COMMITS: AtomicUsize = AtomicUsize::new(0);
 static ROLLBACKS: AtomicUsize = AtomicUsize::new(0);
+static GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Hold the gate and start from a known count.
+fn begin_test() -> std::sync::MutexGuard<'static, ()> {
+    let guard = GATE.lock().unwrap_or_else(|e| e.into_inner());
+    COMMITS.store(0, Ordering::SeqCst);
+    ROLLBACKS.store(0, Ordering::SeqCst);
+    guard
+}
 
 fn compile_page(vfs: &Arc<dyn Vfs>, path: &str) -> BytecodeProgram {
     let source = vfs.read_to_string(path).unwrap();
@@ -69,8 +84,7 @@ fn exec(
 
 #[test]
 fn a_failed_nested_savepoint_still_rolls_the_outer_transaction_back() {
-    COMMITS.store(0, Ordering::SeqCst);
-    ROLLBACKS.store(0, Ordering::SeqCst);
+    let _gate = begin_test();
 
     let mut files = HashMap::new();
     files.insert(
@@ -126,6 +140,77 @@ writeOutput( caught );
         1,
         ROLLBACKS.load(Ordering::SeqCst),
         "the OUTER transaction must be rolled back exactly once"
+    );
+    assert_eq!(
+        0,
+        COMMITS.load(Ordering::SeqCst),
+        "nothing may be committed when the nested block failed"
+    );
+}
+
+#[test]
+fn nesting_before_the_outer_block_has_a_connection_is_refused_too() {
+    // Lucee/ACF defer BEGIN to the first statement, so an outer block that has
+    // not run one yet has NO connection — and the nested block could not take
+    // its savepoint even to find out whether the driver has them. It recorded
+    // "no savepoint" and carried on, so on a savepoint-less driver the nesting
+    // was silently allowed and the inner rollback became a no-op: the inner
+    // block kept the work it asked to discard.
+    //
+    // The same shape with one statement ahead of it (the test above) was
+    // correctly refused the whole time, which is exactly why this went unseen.
+    let _gate = begin_test();
+
+    let mut files = HashMap::new();
+    files.insert(
+        "index.cfm".to_string(),
+        r##"
+<cfscript>
+caught = "";
+try {
+    transaction {
+        // No statement here, so the transaction is still PENDING.
+        transaction {
+            queryExecute( "insert into t values (2)", [], { datasource = "stub" } );
+        }
+    }
+} catch ( any e ) {
+    caught = e.message;
+}
+writeOutput( caught );
+</cfscript>
+"##
+        .as_bytes()
+        .to_vec(),
+    );
+
+    let vfs: Arc<dyn Vfs> = Arc::new(EmbeddedFs::new(files, VROOT.to_string()));
+    let page_path = format!("{}/index.cfm", VROOT);
+    let program = compile_page(&vfs, &page_path);
+
+    let mut vm = CfmlVirtualMachine::new(program);
+    vm.vfs = vfs;
+    vm.source_file = Some(Arc::from(page_path.as_str()));
+    vm.base_template_path = Some(page_path);
+    for (name, value) in get_builtins() {
+        vm.globals.insert(name, value);
+    }
+    for (name, func) in get_builtin_functions() {
+        vm.builtins.insert(name, func);
+    }
+    vm.txn_begin = Some(begin);
+    vm.txn_commit = Some(commit);
+    vm.txn_rollback = Some(rollback);
+    vm.txn_savepoint = Some(savepoint);
+    vm.txn_execute = Some(exec);
+
+    vm.execute().unwrap();
+
+    assert!(
+        vm.get_output().contains("savepoint"),
+        "a nested block must report the savepoint refusal even when the outer \
+         transaction had not begun yet, got: {}",
+        vm.get_output()
     );
     assert_eq!(
         0,

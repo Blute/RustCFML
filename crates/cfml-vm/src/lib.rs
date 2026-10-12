@@ -21481,6 +21481,11 @@ impl CfmlVirtualMachine {
                                     self.transaction_conn = Some(conn);
                                     self.transaction_datasource = Some(ds);
                                     self.transaction_pending = false;
+                                    // A nested block that opened while this one
+                                    // was still pending could not take its
+                                    // savepoint — there was no connection yet.
+                                    // Take them now, before the statement runs.
+                                    self.take_owed_savepoints()?;
                                 }
                             }
                         }
@@ -34609,6 +34614,50 @@ impl CfmlVirtualMachine {
     /// `__cftransaction_start` — open a transaction, or turn a nested
     /// `transaction { }` into a SAVEPOINT on the already-open outer one
     /// (Lucee/ACF/BoxLang semantics).
+    /// Take the savepoints owed by nested `transaction { }` blocks that began
+    /// while the enclosing one was still pending.
+    ///
+    /// Lucee/ACF defer BEGIN to the first statement, so
+    ///
+    /// ```text
+    /// transaction {                 // no statement yet — no connection yet
+    ///     transaction { … }         // nests against nothing
+    /// }
+    /// ```
+    ///
+    /// reached the nested block with `transaction_conn == None`. It recorded
+    /// "no savepoint" and carried on, so on a driver WITHOUT savepoints the
+    /// nesting was silently permitted and the inner rollback became a no-op —
+    /// the inner block kept the work it asked to discard. The same shape with
+    /// one statement ahead of it was correctly refused, which is what made
+    /// this hole so easy to miss. Every `None` still in the list at the moment
+    /// the connection opens is one of these: the live-connection path records
+    /// `Some` or fails.
+    fn take_owed_savepoints(&mut self) -> Result<(), CfmlError> {
+        if self.transaction_savepoints.iter().all(Option::is_some) {
+            return Ok(());
+        }
+        let Some(savepoint) = self.txn_savepoint else { return Ok(()) };
+        // Depth 1 is the outer block, so slot `i` belongs to depth `i + 2`.
+        let owed: Vec<(usize, String)> = self
+            .transaction_savepoints
+            .iter()
+            .enumerate()
+            .filter(|(_, sp)| sp.is_none())
+            .map(|(i, _)| (i, format!("cftxn_sp{}", i + 2)))
+            .collect();
+        for (i, name) in owed {
+            if let Some(conn) = self.transaction_conn.as_mut() {
+                savepoint(conn, &name)?;
+            }
+            for (_, extra) in self.transaction_extra_conns.iter_mut() {
+                savepoint(extra, &name)?;
+            }
+            self.transaction_savepoints[i] = Some(name);
+        }
+        Ok(())
+    }
+
     fn cftransaction_start(&mut self, args: &[CfmlValue], parent_locals: &ValueMap) -> CfmlResult {
         if self.transaction_depth >= 1 {
             let depth = self.transaction_depth + 1;

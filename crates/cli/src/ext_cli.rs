@@ -482,7 +482,6 @@ fn package(dir: &Path, name: &str, version: &str, lib: &Path) -> Result<PathBuf,
         "LICENSE-MIT",
         "LICENSE-APACHE",
         "NOTICE",
-        "THIRD-PARTY.txt",
         // The Rust convention for a dual-licensed crate: LICENSE-APACHE +
         // LICENSE-MIT carry the terms, COPYRIGHT explains the choice. Named
         // that way rather than LICENSE so GitHub's licence detection picks one
@@ -493,6 +492,35 @@ fn package(dir: &Path, name: &str, version: &str, lib: &Path) -> Result<PathBuf,
         if p.is_file() {
             if let Ok(data) = fs::read(&p) {
                 zip.start_file(extra, opts).map_err(|e| e.to_string())?;
+                zip.write_all(&data).map_err(|e| e.to_string())?;
+            }
+        }
+    }
+    // Every `THIRD-PARTY*.txt`, not just the one.
+    //
+    // cargo-about generates THIRD-PARTY.txt from the RUST graph, and that is
+    // the whole story only while an extension links nothing else. One that
+    // statically links a native library — DuckDB, say, which vendors ~26 C/C++
+    // projects of its own — has notices cargo-about cannot see and must
+    // generate them into a second file. With a single hard-coded name that
+    // file stayed in the source repository and never reached the archive an
+    // operator installs, which is the one place the obligation actually
+    // attaches.
+    if let Ok(entries) = fs::read_dir(dir) {
+        let mut extra: Vec<_> = entries
+            .flatten()
+            .filter_map(|e| {
+                let name = e.file_name().to_string_lossy().to_string();
+                let is_notice = name.starts_with("THIRD-PARTY")
+                    && (name.ends_with(".txt") || name.ends_with(".md"));
+                (is_notice && e.path().is_file()).then_some((name, e.path()))
+            })
+            .collect();
+        // Deterministic order, so two builds of the same tree are identical.
+        extra.sort();
+        for (name, path) in extra {
+            if let Ok(data) = fs::read(&path) {
+                zip.start_file(&name, opts).map_err(|e| e.to_string())?;
                 zip.write_all(&data).map_err(|e| e.to_string())?;
             }
         }
