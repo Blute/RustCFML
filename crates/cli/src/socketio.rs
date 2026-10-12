@@ -128,6 +128,11 @@ pub(crate) fn build_layer(state: Arc<AppState>) -> SocketIoLayer {
 /// wire up the per-event handlers and the disconnect teardown.
 async fn on_connect(socket: SocketRef, state: Arc<AppState>) {
     let ns = socket.ns().to_string();
+    // Start the application before routing. `is_imperative_ns` can only answer
+    // correctly once `onApplicationStart` has registered its namespaces, and on
+    // a cold server the first socket.io client IS the thing that would have
+    // started it.
+    crate::websocket::ensure_application_started(&state).await;
     // The imperative socket.io-lucee surface owns this namespace if a
     // `SocketIoServer` registered it (via `io.of(ns)`). Otherwise fall through
     // to the convention `websockets/<name>.cfc` discovery. The two surfaces

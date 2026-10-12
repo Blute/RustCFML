@@ -1,10 +1,20 @@
 //! Bridging MCP requests to the (synchronous) VM.
 //!
 //! Same recipe as the WebSocket driver: every call builds a fresh VM on a
-//! blocking worker, instantiates the server CFC and invokes one method. A
-//! fresh VM per call means a tool carries no state between invocations except
-//! through `application`/`server` scope — identical to the contract a
-//! WebSocket handler has, and the reason a tool is safe to run concurrently.
+//! blocking worker, enters the application, instantiates the server CFC and
+//! invokes one method. A fresh VM per call means a tool carries no state
+//! between invocations except through `application`/`server` scope — identical
+//! to the contract a WebSocket handler has, and the reason a tool is safe to
+//! run concurrently.
+//!
+//! Entering the application is what makes that contract true. Until it was
+//! added, every dispatch here ran with NO application scope: `onApplicationStart`
+//! never fired however long the server had been up, `application` was empty even
+//! when a page had already booted the app in the same process, and a write to it
+//! was silently discarded — so the `application.hits` counter in the MCP docs
+//! threw "key [HITS] doesn't exist" on its own example. An agent connecting
+//! before any human loaded a page therefore met an unbooted application, which
+//! typically surfaces as an auth failure rather than as what it is.
 
 use std::sync::Arc;
 
@@ -39,6 +49,18 @@ impl McpRuntime {
     }
 }
 
+/// Bind the application (and run `onApplicationStart` once) for one dispatch.
+///
+/// A failure here is the application failing to boot, which is not the caller's
+/// fault and must not be reported as a tool that threw — the message is logged
+/// and returned so the transport can answer with an internal error.
+fn enter_app(vm: &mut CfmlVirtualMachine, what: &str) -> Result<Option<String>, String> {
+    vm.enter_application_for_dispatch().map_err(|e| {
+        log::warn!("MCP: application failed to start for [{what}]: {}", e.message);
+        format!("Application failed to start: {}", e.message)
+    })
+}
+
 /// Reflect the server CFC's tools/resources/prompts.
 ///
 /// Runs on a blocking worker because compiling and instantiating the component
@@ -50,7 +72,13 @@ pub(crate) async fn manifest(
 ) -> Result<ServerManifest, String> {
     tokio::task::spawn_blocking(move || {
         let mut vm = runtime.vm(&info.cfc_path);
-        vm.mcp_manifest(&info.cfc_path, &info.name).map_err(|e| e.to_string())
+        // Reflection still needs the application: the server CFC may extend or
+        // import through a mapping the application declares, and a client's
+        // `initialize` is as entitled to boot a cold app as a first page hit is.
+        let app = enter_app(&mut vm, "manifest")?;
+        let out = vm.mcp_manifest(&info.cfc_path, &info.name).map_err(|e| e.to_string());
+        vm.leave_application_for_dispatch(app.as_deref());
+        out
     })
     .await
     .unwrap_or_else(|e| Err(format!("MCP manifest task panicked: {e}")))
@@ -85,13 +113,25 @@ pub(crate) async fn authenticate(
             CfmlValue::Struct(s) => s,
             _ => unreachable!("strukt always yields a Struct"),
         };
-        match vm.mcp_authenticate(&cfc, args) {
+        // The hook is the reason this matters most: it is documented as leaning
+        // on an `application`-scope principal cache, and it is the FIRST thing an
+        // agent reaches — before any page has necessarily booted the app.
+        let app = match enter_app(&mut vm, "authenticate") {
+            Ok(a) => a,
+            Err(e) => {
+                log::warn!("MCP: authenticate hook [{hook}] could not enter the application: {e}");
+                return None;
+            }
+        };
+        let out = match vm.mcp_authenticate(&cfc, args) {
             Ok(value) => Some(value),
             Err(e) => {
                 log::warn!("MCP: authenticate hook [{hook}] refused by throwing: {}", e.message);
                 None
             }
-        }
+        };
+        vm.leave_application_for_dispatch(app.as_deref());
+        out
     })
     .await
     .unwrap_or_else(|e| {
@@ -156,13 +196,20 @@ pub(crate) async fn call(
             CfmlValue::Struct(s) => s,
             _ => unreachable!("strukt always yields a Struct"),
         };
-        vm.dispatch_mcp(&info.cfc_path, &entity, args, ctx).map_err(|e| CallFailure {
+        let app = enter_app(&mut vm, &entity.name)
+            .map_err(|message| CallFailure { message, denied: false })?;
+        let out = vm.dispatch_mcp(&info.cfc_path, &entity, args, ctx).map_err(|e| CallFailure {
             denied: matches!(
                 &e.error_type,
                 cfml_common::vm::CfmlErrorType::Custom(t) if t == UNAUTHORIZED_TYPE
             ),
             message: e.message.clone(),
-        })
+        });
+        // Publish `application` writes even when the handler threw: a tool that
+        // half-populated a cache and then failed leaves what it wrote, as a page
+        // that threw would.
+        vm.leave_application_for_dispatch(app.as_deref());
+        out
     })
     .await
     .unwrap_or_else(|e| {

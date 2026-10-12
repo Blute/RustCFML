@@ -497,7 +497,8 @@ whichever surface registered it.
 The engine bundles the `SocketIoServer` / `SocketIoNamespace` / `SocketIoSocket`
 CFCs (no install needed). Create the server once and store it somewhere
 long-lived (application scope is the norm) so its handler closures survive across
-requests — typically in `onApplicationStart`:
+requests — typically in `onApplicationStart`, which the first socket.io
+connection runs if no request has yet:
 
 ```cfml
 component {
@@ -617,6 +618,11 @@ loops or backpressure:
 
 - Per-connection dispatch is **serialized**; each message runs on a fresh VM
   (like an HTTP request), so handlers may safely block.
+- Each dispatch enters the **same application a page request does**: the
+  governing `Application.cfc` applies, `onApplicationStart` runs if it has not
+  yet, and `application` scope is the one live scope the whole site shares — so
+  a handler can cache in it and a page sees what the handler wrote.
+  `onRequestStart`/`onRequest`/`onRequestEnd` do not run; a frame is not a page.
 - Outbound frames go through a **bounded queue** — a slow client cannot stall a
   handler; on overflow the connection is closed.
 - Ping/pong is answered by the engine and **never** dispatched to CFML.

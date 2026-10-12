@@ -658,8 +658,50 @@ fn run_dispatch(
         args.push(p);
     }
 
-    vm.dispatch_ws_event(&channel, &cfc_path, method, event.as_deref(), args)
-        .map_err(|e| format!("{e}"))
+    // Enter the application before the handler runs. Without this a channel
+    // handler saw an EMPTY `application` scope — no `onApplicationStart`, and a
+    // write to it silently discarded — even when a page had booted the app in
+    // this same process. The socket.io documentation tells you to build the
+    // server in `onApplicationStart` and read it back from `application.io`,
+    // which could not have worked.
+    let app = match vm.enter_application_for_dispatch() {
+        Ok(a) => a,
+        Err(e) => return Err(format!("application failed to start: {}", e.message)),
+    };
+    let out = vm
+        .dispatch_ws_event(&channel, &cfc_path, method, event.as_deref(), args)
+        .map_err(|e| format!("{e}"));
+    vm.leave_application_for_dispatch(app.as_deref());
+    out
+}
+
+/// Enter (and if necessary start) the application, with no handler to run.
+///
+/// The socket.io-lucee surface needs this BEFORE it can route: a namespace is
+/// "imperative" only once `io.of("/chat")` has registered it, and that happens
+/// in `onApplicationStart`. On a cold server nothing had run the handler, so the
+/// namespace was unknown, the connection fell through to convention discovery
+/// and was refused — the documented pattern could never be the first thing to
+/// connect.
+pub(crate) async fn ensure_application_started(state: &Arc<AppState>) {
+    let server_state = state.server_state.clone();
+    let vfs = state.vfs.clone();
+    let sandbox = state.sandbox;
+    let _ = tokio::task::spawn_blocking(move || {
+        let empty = crate::CfmlCompiler::new()
+            .compile(crate::CfmlParser::new(String::new()).parse().expect("empty source parses"));
+        let mut vm = CfmlVirtualMachine::new(empty);
+        vm.vfs = vfs;
+        vm.sandbox = sandbox;
+        crate::register_vm_runtime(&mut vm);
+        vm.apply_cfconfig(&server_state.cfconfig);
+        vm.server_state = Some(server_state);
+        match vm.enter_application_for_dispatch() {
+            Ok(app) => vm.leave_application_for_dispatch(app.as_deref()),
+            Err(e) => log::warn!("socket.io: application failed to start: {}", e.message),
+        }
+    })
+    .await;
 }
 
 /// What an imperative socket.io-lucee dispatch should run.
@@ -698,13 +740,23 @@ pub(crate) async fn dispatch_sio(
         vm.apply_cfconfig(&server_state.cfconfig);
         vm.session_id = session_id;
         vm.server_state = Some(server_state);
+        // Same application entry as the raw-WebSocket path. This dispatch names
+        // no template — the listener closures live in a process-wide registry —
+        // so the walk-up is anchored at the web root by
+        // `enter_application_for_dispatch`.
+        let app = match vm.enter_application_for_dispatch() {
+            Ok(a) => a,
+            Err(e) => return Err(format!("application failed to start: {}", e.message)),
+        };
         let r = match kind {
             SioDispatch::NsEvent(event) => vm.dispatch_sio_ns(&conn_id, &ns, event),
             SioDispatch::SocketEvent { event, payload } => {
                 vm.dispatch_sio_event(&conn_id, &ns, &event, payload)
             }
         };
-        r.map_err(|e| format!("{e}"))
+        let out = r.map_err(|e| format!("{e}"));
+        vm.leave_application_for_dispatch(app.as_deref());
+        out
     })
     .await
     .unwrap_or_else(|e| Err(format!("socket.io dispatch task panicked: {e}")))

@@ -687,3 +687,43 @@ async fn reqwest_get(url: &str) -> String {
     // Body is after the blank line.
     text.split_once("\r\n\r\n").map(|(_, b)| b.to_string()).unwrap_or_default()
 }
+
+// ── the application context ────────────────────────────────────────────────
+//
+// A channel handler used to run against NO application: `onApplicationStart`
+// never fired, `application` was empty even when a page had booted the app in
+// the same process, and a write to it was silently discarded. The socket.io
+// docs tell you to build the server in `onApplicationStart` and read it back
+// from `application.io`, which could not have worked.
+//
+// (`serves_http` above does one HTTP round trip before any test connects, and
+// its comment says that is what forces the app through boot. That was true
+// then. A socket no longer depends on it.)
+
+#[tokio::test]
+async fn a_socket_frame_runs_inside_the_application() {
+    let server = start_server().await;
+    let url = format!("ws://127.0.0.1:{}/ws/lifecycle", server.port);
+
+    let (mut ws, _) = connect_async(&url).await.expect("connect lifecycle channel");
+    ws.send(Message::Text(r#"{"ping":1}"#.into())).await.unwrap();
+    let ack = next_json(&mut ws).await;
+
+    assert_eq!(ack["d"]["booted"], true, "onApplicationStart did not run: {ack}");
+    assert_eq!(ack["d"]["appName"], "wsFixtureApp", "wrong application: {ack}");
+    assert_eq!(ack["d"]["bootCount"], 1);
+
+    // The scope is the SAME one across frames — a handler can cache in it.
+    ws.send(Message::Text(r#"{"ping":2}"#.into())).await.unwrap();
+    let second = next_json(&mut ws).await;
+    assert_eq!(second["d"]["fromSocket"], 2, "the socket's write was lost: {second}");
+    assert_eq!(second["d"]["bootCount"], 1, "the application restarted between frames");
+
+    // …and it is the same scope a PAGE sees, not a parallel one.
+    let http = format!("http://127.0.0.1:{}/appscope.cfm", server.port);
+    let body = reqwest_get(&http).await;
+    assert_eq!(
+        body.trim(), "2|1",
+        "a page did not see the socket's application write (got {body:?})"
+    );
+}

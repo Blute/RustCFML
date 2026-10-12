@@ -625,6 +625,18 @@ function counter() tool="counter" {
 }
 ```
 
+An MCP call enters the **same application a page request does**: the governing
+`Application.cfc` is found from the server CFC's location, its settings and
+mappings apply, and `onApplicationStart` runs if the application has not started
+yet. An agent that connects to a cold server therefore boots it, exactly as the
+first browser request would — the tool does not have to boot defensively, and a
+tool, a WebSocket handler and a page all read and write one `application` scope.
+
+`onRequestStart`/`onRequest`/`onRequestEnd` do **not** run: a tool call is not a
+page request, and those handlers exist to route and render one. Session scope is
+likewise not attached — MCP has its own session, and
+[`authenticate`](#authenticating-your-own-users) is where an identity belongs.
+
 ## Transports
 
 ### stdio

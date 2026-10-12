@@ -106,6 +106,40 @@ async fn start_server() -> Server {
     server
 }
 
+/// The same server with NO warm-up request — the first thing to touch it is a
+/// socket.io client.
+///
+/// `warmup_get` above is what used to make these tests pass: an imperative
+/// namespace only exists once `onApplicationStart` has called `io.of(ns)`, and
+/// nothing but an HTTP request ever ran that handler. A cold server therefore
+/// did not recognise `/im`, fell through to convention discovery, found no
+/// `websockets/im.cfc` and refused the connection — so the documented
+/// socket.io-lucee pattern could never be the first thing to connect.
+async fn start_server_cold() -> Server {
+    let _serialised = START.lock().unwrap_or_else(|e| e.into_inner());
+    let port = free_port();
+    let child = Command::new(env!("CARGO_BIN_EXE_rustcfml"))
+        .arg("--serve")
+        .arg(fixtures_dir())
+        .arg("--port")
+        .arg(port.to_string())
+        .spawn()
+        .expect("spawn rustcfml --serve");
+    let mut server = Server { child, port };
+    for _ in 0..600 {
+        if std::net::TcpStream::connect(("127.0.0.1", port))
+            .is_ok_and(|s| s.local_addr().ok() != s.peer_addr().ok())
+        {
+            return server;
+        }
+        if let Ok(Some(status)) = server.child.try_wait() {
+            panic!("rustcfml --serve exited before accepting connections: {status}");
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("rustcfml --serve not accepting connections on port {port} after 30s");
+}
+
 #[derive(Debug)]
 enum Packet {
     Connect,
@@ -269,4 +303,28 @@ async fn sio_compat_rooms() {
     sio_emit(&mut a, "/im", "joinRoom", json!({ "room": "lobby" }), None).await;
     let news = expect_event(&mut a, "roomNews").await;
     assert_eq!(news["room"], json!("lobby"), "room-scoped namespace.emit reached the member");
+}
+
+#[tokio::test]
+async fn an_imperative_namespace_answers_a_cold_server() {
+    // No page has ever been served by this process, so the connect itself has
+    // to start the application that registers `/im`.
+    let server = start_server_cold().await;
+
+    let mut a = sio_connect(server.port, "/im", "").await;
+    let welcome = expect_event(&mut a, "welcome").await;
+    assert!(
+        welcome["id"].is_string(),
+        "the connect listener registered in onApplicationStart did not run: {welcome}"
+    );
+
+    // And the handler it registered works, not just the handshake.
+    sio_emit(&mut a, "/im", "say", json!({ "text": "cold" }), Some(1)).await;
+    for _ in 0..20 {
+        if let Packet::Ack(1, data) = next_packet(&mut a).await {
+            assert_eq!(data["text"], json!("cold"));
+            return;
+        }
+    }
+    panic!("no ack from the imperative handler on a cold server");
 }

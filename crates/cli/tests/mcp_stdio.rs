@@ -526,3 +526,68 @@ fn every_advertised_capability_has_its_required_methods() {
     let reply = s.call(json!({ "jsonrpc": "2.0", "id": 4, "method": "ping" }));
     assert_eq!(reply["id"], 4);
 }
+
+// ── the application context ────────────────────────────────────────────────
+//
+// An MCP call used to run against NO application: `onApplicationStart` never
+// fired, `application` was empty even when a page had booted the app in the
+// same process, and a write to it was silently discarded. An agent connecting
+// before any human loaded a page therefore met an unbooted application, which
+// an app typically reports as an auth failure rather than as what it is.
+//
+// `docs/mcp.md` promised the opposite — "nothing carries between tool calls
+// except through `application` or `server` scope" — and shipped the `counter()`
+// example these tests now run verbatim.
+
+/// Call a tool and return its `structuredContent`, failing loudly on a tool
+/// error so a regression reads as the assertion it is.
+fn tool(s: &mut Server, id: i64, name: &str) -> Value {
+    let reply = s.call(json!({
+        "jsonrpc": "2.0", "id": id, "method": "tools/call",
+        "params": { "name": name, "arguments": {} }
+    }));
+    assert!(
+        reply["result"]["isError"] != json!(true),
+        "tool [{name}] failed: {}",
+        reply["result"]["content"][0]["text"]
+    );
+    reply["result"].clone()
+}
+
+#[test]
+fn a_tool_call_starts_the_application_when_nothing_else_has() {
+    // A COLD process whose only caller is this client — no page is ever served.
+    let mut s = Server::start_named("life");
+    s.initialize();
+
+    let state = tool(&mut s, 2, "state")["structuredContent"].clone();
+    assert_eq!(state["booted"], true, "onApplicationStart did not run: {state}");
+    assert_eq!(state["appName"], "mcpFixtureApp", "wrong application: {state}");
+    assert_eq!(state["bootCount"], 1);
+}
+
+#[test]
+fn onapplicationstart_runs_once_across_many_calls() {
+    let mut s = Server::start_named("life");
+    s.initialize();
+    for id in 2..=5 {
+        let state = tool(&mut s, id, "state")["structuredContent"].clone();
+        assert_eq!(state["bootCount"], 1, "the application restarted on call {id}");
+    }
+}
+
+#[test]
+fn application_scope_carries_between_tool_calls() {
+    // The `counter()` example from docs/mcp.md, verbatim in the fixture. It
+    // used to answer `isError: true` — "key [HITS] doesn't exist" — on its own
+    // documented example, because the write never landed anywhere.
+    let mut s = Server::start_named("life");
+    s.initialize();
+    for (id, expected) in [(2, 1), (3, 2), (4, 3)] {
+        let result = tool(&mut s, id, "counter");
+        assert_eq!(
+            result["content"][0]["text"], expected.to_string(),
+            "application scope did not persist between calls"
+        );
+    }
+}

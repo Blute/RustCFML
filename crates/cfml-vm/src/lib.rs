@@ -43892,7 +43892,24 @@ impl CfmlVirtualMachine {
     }
 
     /// Execute with Application.cfc lifecycle
-    pub fn execute_with_lifecycle(&mut self) -> CfmlResult {
+    /// Enter the application context for this run: find the governing
+    /// Application.cfc, apply its settings, bind the named `application` scope
+    /// from the shared store, and run `onApplicationStart` once.
+    ///
+    /// Split out of [`Self::execute_with_lifecycle`] so that a dispatch which is
+    /// NOT a page request — an MCP tool call, a WebSocket frame — can enter the
+    /// same application instead of running against an unbound scope. Both of
+    /// those used to go straight to the handler, so `application` was empty, a
+    /// write to it was silently discarded, and `onApplicationStart` never fired
+    /// however long the server had been up. The docs promised the opposite
+    /// ("nothing carries between tool calls except through `application` or
+    /// `server` scope"), which is the contract this restores.
+    ///
+    /// `Ok(None)` means no Application.cfc governs this path; the caller runs
+    /// with the scope this seeded. The session lifecycle is deliberately NOT
+    /// here — it belongs to a request, and the callers that have one run it
+    /// themselves.
+    fn enter_application_context(&mut self) -> Result<Option<EnteredApplication>, CfmlError> {
         // Start the requestTimeout clock before any user code — including the
         // no-Application.cfc early return below (§3).
         self.begin_request_timeout_clock();
@@ -43935,7 +43952,7 @@ impl CfmlVirtualMachine {
                 // Dropping an Application.cfc into the directory "fixed" it, which
                 // made the config look intermittent (GH #305).
                 self.seed_cfconfig_context_paths();
-                return self.execute(); // No Application.cfc, just execute directly
+                return Ok(None); // No Application.cfc — the caller just executes
             }
         };
 
@@ -43993,7 +44010,7 @@ impl CfmlVirtualMachine {
         // when Application.cfc fails to load.
         let mut template = match self.load_application_cfc(&app_cfc_path) {
             Ok(Some(t)) => t,
-            Ok(None) => return self.execute(), // No usable component, fall through
+            Ok(None) => return Ok(None), // No usable component, fall through
             Err(e) => return Err(e),
         };
 
@@ -44434,6 +44451,66 @@ impl CfmlVirtualMachine {
             // Still call onApplicationStart in CLI mode
             let _ = self.call_lifecycle_method(&mut template, "onApplicationStart", vec![]);
         }
+        Ok(Some(EnteredApplication {
+            template,
+            app_name,
+            session_management,
+            session_timeout,
+        }))
+    }
+
+    /// Enter the application context for a non-request dispatch, and report the
+    /// application's name so the caller can persist its scope afterwards with
+    /// [`Self::leave_application_for_dispatch`].
+    ///
+    /// Runs `onApplicationStart` if the application has not started — a cold
+    /// server whose first caller is an agent boots the application for that
+    /// call, exactly as a first page request would.
+    pub fn enter_application_for_dispatch(&mut self) -> Result<Option<String>, CfmlError> {
+        // A dispatch that names no template (the socket.io compatibility layer
+        // invokes a closure held in a process-wide registry) still has to find
+        // the application. Anchor the walk-up at the web root rather than the
+        // process CWD, which in serve mode is wherever the operator started the
+        // engine and may be nowhere near the site.
+        if self.base_template_path.is_none() && self.source_file.is_none() {
+            if let Some(root) = self.server_state.as_ref().and_then(|ss| ss.webroot.clone()) {
+                self.base_template_path =
+                    Some(root.join("index.cfm").to_string_lossy().to_string());
+            }
+        }
+        match self.enter_application_context()? {
+            Some(entered) => {
+                // Keep the Application.cfc `this` scope published for the whole
+                // dispatch: getApplicationMetadata() and friends read it, and a
+                // handler is as entitled to them as a page is.
+                self.app_cfc_template = Some(entered.template);
+                Ok(Some(entered.app_name))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Publish a dispatch's `application` scope writes back to the store, the
+    /// way the end of a request does. Without this a distributed (datasource-
+    /// backed) application store never sees what a tool or socket handler wrote.
+    pub fn leave_application_for_dispatch(&mut self, app_name: Option<&str>) {
+        if let Some(name) = app_name {
+            self.persist_application_state(name);
+        }
+        self.app_cfc_template = None;
+    }
+
+    pub fn execute_with_lifecycle(&mut self) -> CfmlResult {
+        let Some(EnteredApplication {
+            mut template,
+            app_name,
+            session_management,
+            session_timeout,
+        }) = self.enter_application_context()?
+        else {
+            return self.execute();
+        };
+
 
         // 5b. Session lifecycle
         //
@@ -44471,7 +44548,7 @@ impl CfmlVirtualMachine {
                     session.last_accessed_secs = now_epoch_secs();
                     session.timeout_secs = session_timeout;
                     self.store_session_record(session);
-                } else if lazy_session_creation {
+                } else if self.lazy_session_creation {
                     // Lazy: defer record creation + onSessionStart until
                     // the first write to session scope. Keep any cookie
                     // sid intact so a re-used cookie value sticks.
@@ -46337,3 +46414,11 @@ fn ascii_lower_in<'a>(name: &str, buf: &'a mut [u8; MEMBER_BIF_NAME_BUF]) -> Opt
     std::str::from_utf8(&buf[..bytes.len()]).ok()
 }
 
+/// What [`CfmlVirtualMachine::enter_application_context`] resolved: the loaded
+/// Application.cfc and the session settings the request path still needs.
+struct EnteredApplication {
+    template: CfmlValue,
+    app_name: String,
+    session_management: bool,
+    session_timeout: u64,
+}
