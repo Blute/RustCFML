@@ -16,7 +16,7 @@ use std::collections::{HashMap, HashSet};
 /// for user-controlled input.
 type FxHashMap<K, V> = HashMap<K, V, std::hash::BuildHasherDefault<rustc_hash::FxHasher>>;
 type FxHashSet<K> = HashSet<K, std::hash::BuildHasherDefault<rustc_hash::FxHasher>>;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::SystemTime;
 
 /// `global_id` accumulator for the application-scope function-reachability walk
@@ -178,6 +178,52 @@ pub mod mcp;
 pub mod flush;
 pub use application_store::{ApplicationStore, MemoryApplicationStore};
 pub use session_store::{MemoryStore, SessionStore};
+
+/// Binds a datasource whose `driver` names an extension rather than one of the
+/// bundled kinds. Returns true when an extension took it.
+///
+/// WHY A HOOK. The binder needs `cfml_stdlib::register_dynamic_datasource` and
+/// the loaded `.rcx` driver tables, which live in the CLI; `cfml-vm`'s
+/// dependency on `cfml-stdlib` is deliberately optional (the wasm targets build
+/// without it) and it cannot depend on the CLI at all. So the host installs a
+/// function pointer at extension-load time and the VM calls through it — the
+/// same indirection as the `__register_ds_timeout` builtin, expressed as a
+/// pointer because the payload is a `DatasourceCfg` rather than CFML values.
+///
+/// It takes the config rather than a pre-built struct so the host can normalise
+/// it exactly as the cfconfig path does; the two routes must agree about what a
+/// driver is handed, or a datasource would behave differently depending on
+/// where it was declared.
+pub type ExtensionDatasourceBinder = fn(name: &str, ds: &cfml_config::schema::DatasourceCfg) -> bool;
+
+/// How one `this.datasources` entry resolved.
+enum AppDatasourceBinding {
+    /// A bundled driver: `(connection url, connection-acquire timeout secs)`.
+    Url(String, u32),
+    /// Claimed by an extension driver, which registers under the datasource
+    /// NAME — there is no URL to put in the per-app map.
+    Extension,
+    /// Nothing can serve it. Carries the declared driver for the warning.
+    Unusable(String),
+}
+
+static EXTENSION_DATASOURCE_BINDER: OnceLock<ExtensionDatasourceBinder> = OnceLock::new();
+
+/// Install the host's extension-datasource binder. First caller wins; later
+/// calls are ignored and report false, matching the other once-per-process
+/// registration slots.
+pub fn set_extension_datasource_binder(f: ExtensionDatasourceBinder) -> bool {
+    EXTENSION_DATASOURCE_BINDER.set(f).is_ok()
+}
+
+/// Call the installed binder, if there is one. No host hook (wasm, a bare
+/// embedding, or a build with no extensions loaded) means no extension can
+/// claim the datasource, and the caller falls back to the bundled route.
+fn bind_extension_datasource(name: &str, ds: &cfml_config::schema::DatasourceCfg) -> bool {
+    EXTENSION_DATASOURCE_BINDER
+        .get()
+        .is_some_and(|bind| bind(name, ds))
+}
 use java_shims::{
     handle_java_class, handle_java_collections, handle_java_concurrenthashmap,
     handle_java_concurrentlinkedqueue, handle_java_date, handle_java_file, handle_java_files,
@@ -41733,6 +41779,20 @@ impl CfmlVirtualMachine {
         }
     }
 
+    /// Offer a datasource to the extension drivers, if the host installed a
+    /// binder and the driver is not one of the bundled kinds.
+    ///
+    /// A non-bundled driver has nowhere else to go: `connection_url()` matches
+    /// only the bundled kinds, so it returns `None` and the entry is dropped —
+    /// or, worse, returns a `connectionString` verbatim whatever the driver,
+    /// which the bundled catch-all then opens as a SQLite file named after the
+    /// string. That answered `select 1` from the wrong database. The cfconfig
+    /// path in the CLI has offered extensions first since v0.733.0; this is the
+    /// same gate for the three routes that reach datasources through the VM.
+    fn offer_datasource_to_extension(name: &str, ds: &cfml_config::schema::DatasourceCfg) -> bool {
+        !ds.is_bundled_driver() && bind_extension_datasource(name, ds)
+    }
+
     /// Apply an already-computed per-app cfconfig to this request: overlay the
     /// per-VM runtime knobs, seed per-app datasources, and stash it as the source
     /// for the CFML-visible `server.cfconfig`. Runs every request (cheap); the
@@ -41744,6 +41804,12 @@ impl CfmlVirtualMachine {
         // process-global baseline. `this.datasources` (read later from
         // Application.cfc) overrides these.
         for (name, ds) in merged.datasources.iter() {
+            // An extension's driver kind is offered the datasource first; see
+            // `offer_datasource_to_extension`. A bound one resolves by NAME
+            // through the dynamic registry, so it needs no per-app URL entry.
+            if Self::offer_datasource_to_extension(name, ds) {
+                continue;
+            }
             if let Some(url) = ds.connection_url() {
                 self.register_ds_timeout_via_builtin(&url, ds.connection_timeout);
                 self.app_datasources.insert(name.to_lowercase(), url.clone());
@@ -41823,7 +41889,14 @@ impl CfmlVirtualMachine {
                 {
                     return name;
                 }
-                if let Some((url, _)) = Self::datasource_value_to_url(val) {
+                // An inline definition with no `name`. Only a URL is useful
+                // here — the caller wants something resolvable to put in the
+                // `datasource` attribute — so an extension-bound entry is not
+                // offered: it would have nothing to return. Such a datasource
+                // is addressed by name, which this branch has already ruled out.
+                if let AppDatasourceBinding::Url(url, _) =
+                    Self::datasource_value_to_binding("", val)
+                {
                     return url;
                 }
                 val.as_string()
@@ -41832,22 +41905,36 @@ impl CfmlVirtualMachine {
         }
     }
 
-    fn datasource_value_to_url(val: &CfmlValue) -> Option<(String, u32)> {
+    /// How a single `this.datasources` entry was resolved.
+    ///
+    /// `Extension` and `Unusable` must stay distinct: both mean "no connection
+    /// URL", and treating them as one is what let a `driver = \"duckdb\"` entry
+    /// be dropped in silence.
+    fn datasource_value_to_binding(name: &str, val: &CfmlValue) -> AppDatasourceBinding {
         match val {
-            CfmlValue::String(s) if !s.is_empty() => Some((s.to_string(), 0)),
+            CfmlValue::String(s) if !s.is_empty() => AppDatasourceBinding::Url(s.to_string(), 0),
             CfmlValue::Struct(s) => {
                 let get = |key: &str| -> String {
                     s.data_get(key).map(|v| v.as_string())
                         .unwrap_or_default()
                 };
                 let ds = cfml_config::DatasourceCfg::from_cfml_struct(&get);
+                // Offered to the extension drivers BEFORE `connection_url`,
+                // which hands back a `connectionString` whatever the driver
+                // names — see `offer_datasource_to_extension`.
+                if Self::offer_datasource_to_extension(name, &ds) {
+                    return AppDatasourceBinding::Extension;
+                }
                 // Optional per-datasource connection-acquire timeout (seconds);
                 // lets an app make an unreachable datasource fail fast. The
                 // `get` helper is case-insensitive so this matches any casing.
                 let timeout: u32 = get("connectionTimeout").trim().parse().unwrap_or(0);
-                ds.connection_url().map(|url| (url, timeout))
+                match ds.connection_url() {
+                    Some(url) => AppDatasourceBinding::Url(url, timeout),
+                    None => AppDatasourceBinding::Unusable(ds.driver.clone()),
+                }
             }
-            _ => None,
+            _ => AppDatasourceBinding::Unusable(String::new()),
         }
     }
 
@@ -41861,9 +41948,25 @@ impl CfmlVirtualMachine {
         if let Some(CfmlValue::Struct(map)) = s.data_get("datasources")
         {
             for (name, def) in map.iter() {
-                if let Some((url, timeout)) = Self::datasource_value_to_url(&def) {
-                    self.register_ds_timeout_via_builtin(&url, timeout);
-                    self.app_datasources.insert(name.to_lowercase(), url);
+                match Self::datasource_value_to_binding(&name, &def) {
+                    AppDatasourceBinding::Url(url, timeout) => {
+                        self.register_ds_timeout_via_builtin(&url, timeout);
+                        self.app_datasources.insert(name.to_lowercase(), url);
+                    }
+                    // Bound to an extension driver under its own name; the
+                    // dynamic registry resolves it, so there is no URL to map.
+                    AppDatasourceBinding::Extension => {}
+                    AppDatasourceBinding::Unusable(driver) => {
+                        // Silence here cost a confusing "datasource could not
+                        // be found" at the first query, naming the datasource
+                        // and saying nothing about the driver that failed.
+                        log::warn!(
+                            "this.datasources.{}: unrecognised driver '{}'; \
+                             no bundled driver matches and no extension claimed it",
+                            name,
+                            driver
+                        );
+                    }
                 }
             }
         }
@@ -46470,4 +46573,118 @@ struct EnteredApplication {
     app_name: String,
     session_management: bool,
     session_timeout: u64,
+}
+
+#[cfg(test)]
+mod app_datasource_binding_tests {
+    //! A `this.datasources` entry naming an EXTENSION driver must be offered to
+    //! the host binder before `connection_url()` sees it.
+    //!
+    //! Before this, `connection_url()` matched only the five bundled kinds, so
+    //! `driver = "duckdb"` returned `None` and the entry was dropped without a
+    //! word — the first query then reported "datasource could not be found".
+    //! Worse, an entry carrying a `connectionString` short-circuits that match
+    //! whatever its driver, so it WAS accepted, fell through the bundled
+    //! catch-all, and was opened as a SQLite file named after the string: it
+    //! answered `select 1` from the wrong database.
+    //!
+    //! The binder is a process-global `OnceLock`, so these tests share one
+    //! installation and record what they were offered.
+
+    use super::{AppDatasourceBinding, CfmlVirtualMachine};
+    use cfml_common::dynamic::{CfmlValue, ValueMap};
+    use std::sync::Mutex;
+
+    static OFFERED: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+    /// Claims any driver whose name starts with `ext`, so the tests can cover
+    /// both "an extension took it" and "nobody did".
+    fn fake_binder(name: &str, ds: &cfml_config::schema::DatasourceCfg) -> bool {
+        let kind = ds.canonical_driver();
+        OFFERED
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(format!("{name}:{kind}"));
+        kind.starts_with("ext")
+    }
+
+    fn install() {
+        super::set_extension_datasource_binder(fake_binder);
+    }
+
+    fn offers() -> Vec<String> {
+        OFFERED.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    fn ds(pairs: &[(&str, &str)]) -> CfmlValue {
+        let mut m = ValueMap::default();
+        for (k, v) in pairs {
+            m.insert(k.to_string(), CfmlValue::string(v.to_string()));
+        }
+        CfmlValue::strukt(m)
+    }
+
+    #[test]
+    fn the_three_outcomes_stay_distinct() {
+        install();
+
+        // An extension driver is claimed, and never reaches connection_url.
+        let v = ds(&[("driver", "extdb"), ("database", ":memory:")]);
+        assert!(
+            matches!(
+                CfmlVirtualMachine::datasource_value_to_binding("lake", &v),
+                AppDatasourceBinding::Extension
+            ),
+            "an extension driver was not offered to the binder"
+        );
+
+        // A bundled driver still produces a URL — and must NOT be offered to
+        // an extension, or one could quietly take over `mysql`.
+        let v = ds(&[("driver", "sqlite"), ("database", "/tmp/x.db")]);
+        assert!(
+            matches!(
+                CfmlVirtualMachine::datasource_value_to_binding("sq", &v),
+                AppDatasourceBinding::Url(_, _)
+            ),
+            "a bundled driver stopped producing a connection URL"
+        );
+
+        // Nothing can serve it: distinct from Extension, and it carries the
+        // driver name so the caller can say which one failed.
+        let v = ds(&[("driver", "notadriver"), ("database", "x")]);
+        match CfmlVirtualMachine::datasource_value_to_binding("bogus", &v) {
+            AppDatasourceBinding::Unusable(driver) => assert_eq!(driver, "notadriver"),
+            _ => panic!("an unknown driver must be Unusable, not silently dropped"),
+        }
+
+        let offered = offers();
+        assert!(
+            offered.contains(&"lake:extdb".to_string()),
+            "binder never saw the extension datasource: {offered:?}"
+        );
+        assert!(
+            !offered.iter().any(|o| o.starts_with("sq:")),
+            "a BUNDLED driver was offered to an extension: {offered:?}"
+        );
+    }
+
+    #[test]
+    fn a_connection_string_does_not_smuggle_an_extension_driver_to_sqlite() {
+        install();
+
+        // The dangerous shape: `connection_url()` returns a connectionString
+        // verbatim whatever the driver names, so without the extension offer
+        // this became a URL and the bundled catch-all opened it as SQLite.
+        let v = ds(&[
+            ("driver", "extdb"),
+            ("connectionString", "extdb://./warehouse.db"),
+        ]);
+        assert!(
+            matches!(
+                CfmlVirtualMachine::datasource_value_to_binding("cs", &v),
+                AppDatasourceBinding::Extension
+            ),
+            "a connectionString let an extension driver through to the bundled route"
+        );
+    }
 }

@@ -443,6 +443,58 @@ fn datasource_cfg_as_struct(
 /// Bind `name` to the extension driver of kind `kind`, built with `cfg`.
 /// Returns false when no extension supplies that kind.
 #[cfg(not(target_arch = "wasm32"))]
+/// The VM's hook into [`bind_extension_datasource`].
+///
+/// Datasources declared in Application.cfc are re-read on EVERY request, so
+/// this binds a name once and then leaves it alone: rebuilding would discard a
+/// live connection pool per request. A redeclaration under the same name is
+/// therefore ignored, and a *differing* one is reported rather than silently
+/// losing — two applications in one process that disagree about a datasource
+/// name would otherwise behave according to whichever served the first request.
+fn bind_app_datasource_to_extension(
+    name: &str,
+    ds: &cfml_config::schema::DatasourceCfg,
+) -> bool {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+
+    // Datasource name -> the config fingerprint it was bound with.
+    static BOUND: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+
+    let kind = ds.canonical_driver();
+    let fingerprint = format!(
+        "{}|{}|{}|{}|{}|{}",
+        kind, ds.host, ds.port, ds.database, ds.username, ds.connection_string
+    );
+    let key = name.to_lowercase();
+
+    let mut bound = BOUND
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+
+    if let Some(previous) = bound.get(&key) {
+        if previous != &fingerprint {
+            log::warn!(
+                "datasource '{}' was already bound to extension driver '{}' with a \
+                 different configuration; keeping the first. Give the two \
+                 datasources different names if both are wanted.",
+                name,
+                kind
+            );
+        }
+        // Already serving under this name — report success so the caller does
+        // not fall through to the bundled route and open the wrong database.
+        return true;
+    }
+
+    if bind_extension_datasource(name, &kind, datasource_cfg_as_struct(name, ds)) {
+        bound.insert(key, fingerprint);
+        return true;
+    }
+    false
+}
+
 fn bind_extension_datasource(
     name: &str,
     kind: &str,
@@ -532,6 +584,14 @@ pub fn load_extensions(
         }
     }
     let _ = EXTENSION_DRIVERS.set(kinds);
+    // Let the VM reach the binder. `this.datasources` in Application.cfc, a
+    // per-app `.cfconfig.json` overlay and `cfadmin action="updateDatasource"`
+    // all resolve datasources inside cfml-vm, which cannot call this directly:
+    // its dependency on cfml-stdlib is optional and it has none on the CLI.
+    // Without this hook those three routes saw bundled drivers only — a
+    // `driver = "duckdb"` entry was dropped unbound, and one carrying a
+    // `connectionString` was opened as a SQLite file named after the string.
+    cfml_vm::set_extension_datasource_binder(bind_app_datasource_to_extension);
     if verbose && !loaded.is_empty() {
         for ext in &loaded {
             println!(

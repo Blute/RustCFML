@@ -196,13 +196,16 @@ impl CfmlVirtualMachine {
             def.insert(mapped.to_string(), v.clone());
         }
         let def = CfmlValue::strukt(def);
-        match Self::datasource_value_to_url(&def) {
-            Some((url, timeout)) => {
+        match Self::datasource_value_to_binding(&name, &def) {
+            crate::AppDatasourceBinding::Url(url, timeout) => {
                 self.register_ds_timeout_via_builtin(&url, timeout);
                 self.app_datasources.insert(name.to_lowercase(), url);
                 Ok(CfmlValue::Null)
             }
-            None => Err(CfmlError::runtime(format!(
+            // An extension driver claimed it and registered under the
+            // datasource name; nothing to map to a URL.
+            crate::AppDatasourceBinding::Extension => Ok(CfmlValue::Null),
+            crate::AppDatasourceBinding::Unusable(_) => Err(CfmlError::runtime(format!(
                 "cfadmin action [updateDatasource] could not build a connection for [{}]: \
                  a driver (dbdriver/type) and either a database/host pair or a \
                  connectionString are required.",
