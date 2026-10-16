@@ -25,8 +25,12 @@ jobs:
         with:
           targets: wasm32-unknown-unknown
 
-      - name: Install wasm-pack
-        run: cargo install wasm-pack
+      # Pinned, prebuilt — same as tests.yml. An unpinned `cargo install
+      # wasm-pack` builds whatever is newest from source, and wasm-pack 0.15.0
+      # cannot be built at all (every `zip` version it requires is yanked).
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-pack@0.14.0
 
       - name: Build WASM package
         run: wasm-pack build crates/wasm --target web
