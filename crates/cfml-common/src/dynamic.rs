@@ -687,8 +687,11 @@ pub struct StructInner {
     /// `cookie["x"] =`, `structInsert` — is covered by one choke point.
     pub cookie_scope: bool,
     /// Attributes of cookies written in long form, keyed by lower-cased name.
-    /// Empty (and never allocated into) on every struct but the cookie scope.
-    pub cookie_attrs: std::collections::HashMap<String, CfmlValue>,
+    /// `None` on every struct but the cookie scope. Boxed because an inline
+    /// `HashMap` is 48 bytes on EVERY struct in the process: it pushed the
+    /// struct's allocation from the 128-byte size class into the 192-byte one,
+    /// a third of the ~86 MB of struct headers on a Preside admin.
+    pub cookie_attrs: Option<Box<std::collections::HashMap<String, CfmlValue>>>,
     /// Live `variables.this` alias (Lucee/ACF semantics). When set on a CFC's
     /// private `__variables` struct, a read of the `this` key resolves to the
     /// upgraded handle — the component's live public scope — rather than a
@@ -1196,7 +1199,7 @@ impl CfmlStruct {
             read_only: false,
             persistent_scope: false,
             cookie_scope: false,
-            cookie_attrs: std::collections::HashMap::new(),
+            cookie_attrs: None,
             this_alias: None,
             #[cfg(feature = "component-instance")]
             this_instance_alias: None,
@@ -1233,7 +1236,7 @@ impl CfmlStruct {
             read_only: false,
             persistent_scope: false,
             cookie_scope: false,
-            cookie_attrs: std::collections::HashMap::new(),
+            cookie_attrs: None,
             this_alias: None,
             #[cfg(feature = "component-instance")]
             this_instance_alias: None,
@@ -1266,7 +1269,7 @@ impl CfmlStruct {
     /// Attributes recorded for cookies written in long form, keyed by
     /// lower-cased cookie name.
     pub fn cookie_attrs(&self) -> std::collections::HashMap<String, CfmlValue> {
-        self.0.read().cookie_attrs.clone()
+        self.0.read().cookie_attrs.as_deref().cloned().unwrap_or_default()
     }
 
     /// Mark this struct as a persistent scope (application / session / server),
@@ -1643,6 +1646,7 @@ impl CfmlStruct {
                 self.0
                     .write()
                     .cookie_attrs
+                    .get_or_insert_with(Default::default)
                     .insert(k.as_str().to_ascii_lowercase(), value);
                 return self.insert_inner(k, plain);
             }
@@ -1709,9 +1713,8 @@ impl CfmlStruct {
             // or a later plain write under the same name would be rendered
             // from the dead struct (GH #486). Free inside the write lock we
             // already hold, and the map is empty for every non-cookie scope.
-            if g.cookie_scope {
-                let lower = key.to_ascii_lowercase();
-                g.cookie_attrs.remove(&lower);
+            if let Some(attrs) = g.cookie_attrs.as_mut() {
+                attrs.remove(&key.to_ascii_lowercase());
             }
         }
         let persistent = g.persistent_scope;
