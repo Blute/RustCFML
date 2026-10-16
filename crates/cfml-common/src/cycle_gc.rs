@@ -1688,7 +1688,28 @@ struct PersistentSet {
     entries: Vec<TrackedAlloc>,
     seen: PtrSet,
     next_sweep: usize,
+    /// `entries.len()` right after the last sweep or dead-entry prune. The
+    /// prune runs once the set has grown `PRUNE_STEP` past this mark — see
+    /// [`prune_dead_entries`].
+    pruned_at: usize,
 }
+
+/// How many entries the cross-request set may grow past its last compaction
+/// before the dead ones are pruned (see [`prune_dead_entries`]).
+///
+/// Why this exists: a container alive at request end is carried here as a
+/// `Weak`, and the set was only compacted by the doubling-rule sweep. But a
+/// `Weak` keeps the node's `Arc` block allocated after its value has dropped —
+/// so every carried container that died in a LATER request (the common shape:
+/// a per-request value that replaces its predecessor in a persistent scope,
+/// such as `server.cfconfig`, or a cached query that expired) left a ~200-byte
+/// shell behind until the set reached TWICE the live base. On a Preside admin
+/// with a ~600k live base that was ~600k dead shells, ~120 MB, accumulating
+/// at ~50 per request and only given back every 13k requests: a sawtooth that
+/// reads as a leak. The prune is a `strong_count` scan — no marking, no walk —
+/// so it is cheap enough to bound the dead shells at `PRUNE_STEP` regardless
+/// of the live base.
+const PRUNE_STEP: usize = 10_000;
 
 static PERSISTENT: parking_lot::Mutex<Option<PersistentSet>> = parking_lot::Mutex::new(None);
 
@@ -1808,6 +1829,7 @@ fn carry_survivors(live: Vec<(usize, TrackedAlloc)>) -> usize {
             entries: Vec::new(),
             seen: PtrSet::default(),
             next_sweep: base,
+            pruned_at: 0,
         });
         for (ptr, t) in live {
             if set.seen.insert(ptr) {
@@ -1820,6 +1842,9 @@ fn carry_survivors(live: Vec<(usize, TrackedAlloc)>) -> usize {
             set.seen.clear();
             Some(std::mem::take(&mut set.entries))
         } else {
+            if set.entries.len() >= set.pruned_at.saturating_add(PRUNE_STEP) {
+                prune_dead_entries(set);
+            }
             None
         }
     };
@@ -1957,6 +1982,40 @@ pub fn sweep_if_displaced() -> usize {
     n
 }
 
+/// Drop the entries whose node has already been freed by refcounting, so their
+/// `Weak` handles stop pinning the dead `Arc` blocks (see [`PRUNE_STEP`]). A
+/// pure `strong_count` scan: nothing is walked and nothing live is touched, so
+/// it is safe at any point and against concurrent requests. `seen` is rebuilt
+/// because a freed block's address can be reused by a new allocation, which
+/// must then be carried as a new entry.
+fn prune_dead_entries(set: &mut PersistentSet) {
+    let before = set.entries.len();
+    set.entries.retain(|t| t.is_alive());
+    set.seen.clear();
+    for t in &set.entries {
+        set.seen.insert(t.ptr());
+    }
+    set.pruned_at = set.entries.len();
+    if std::env::var("RUSTCFML_GC_DEBUG").is_ok() {
+        eprintln!(
+            "[cycle_gc] cross-request prune dropped {} dead handle(s); {} still tracked",
+            before - set.entries.len(),
+            set.entries.len()
+        );
+    }
+}
+
+/// Entries carried across requests, and how many of them are dead (their node
+/// freed by refcounting, the handle still pinning its block). Observability for
+/// the prune; a test hook.
+pub fn persistent_dead_entries() -> (usize, usize) {
+    let g = PERSISTENT.lock();
+    match g.as_ref() {
+        Some(p) => (p.entries.len(), p.entries.iter().filter(|t| !t.is_alive()).count()),
+        None => (0, 0),
+    }
+}
+
 /// Force a cross-request sweep now, ignoring the doubling budget. Returns the
 /// nodes reclaimed. Intended for an idle server (nothing is arriving to trip the
 /// budget) and for the collector's own tests.
@@ -1995,6 +2054,7 @@ fn sweep_entries(entries: Vec<TrackedAlloc>, base: usize) -> usize {
             entries: Vec::new(),
             seen: PtrSet::default(),
             next_sweep: base,
+            pruned_at: 0,
         });
         for (ptr, t) in still_live {
             if set.seen.insert(ptr) {
@@ -2002,6 +2062,7 @@ fn sweep_entries(entries: Vec<TrackedAlloc>, base: usize) -> usize {
             }
         }
         set.next_sweep = std::cmp::max(base, live_count.saturating_mul(2));
+        set.pruned_at = set.entries.len();
     }
     if std::env::var("RUSTCFML_GC_DEBUG").is_ok() {
         eprintln!(
@@ -2902,6 +2963,41 @@ mod incremental_tests {
         a.insert("b".to_string(), CfmlValue::Struct(b.clone()));
         b.insert("a".to_string(), CfmlValue::Struct(a.clone()));
         (a, b)
+    }
+
+    /// A container alive at request end is carried as a `Weak`; when it dies in
+    /// a later request the handle must not pin its block until the doubling
+    /// sweep — the prune drops it once the set has grown `PRUNE_STEP` past its
+    /// last compaction.
+    #[test]
+    fn dead_carried_handles_are_pruned_before_the_doubling_sweep() {
+        std::thread::spawn(|| {
+            arm();
+            // Fresh set so another test's carry does not count toward the step.
+            *PERSISTENT.lock() = None;
+            // Each "request" makes one struct that outlives it (held in `prev`),
+            // then the next request's struct displaces it — the server.cfconfig
+            // shape. More than PRUNE_STEP of these without ever reaching the
+            // doubling threshold (base 50k).
+            let mut prev: Option<CfmlStruct> = None;
+            for _ in 0..(PRUNE_STEP + 5) {
+                enable();
+                let s = CfmlStruct::new(ValueMap::default());
+                s.insert("k".to_string(), CfmlValue::Int(1));
+                prev = Some(s);
+                collect();
+            }
+            drop(prev);
+            let (entries, dead) = persistent_dead_entries();
+            assert!(
+                entries < PRUNE_STEP,
+                "dead handles should have been pruned: {entries} carried, {dead} dead"
+            );
+            *PERSISTENT.lock() = None;
+            disable_and_clear();
+        })
+        .join()
+        .unwrap();
     }
 
     /// The request census counts what was created by kind and what is still

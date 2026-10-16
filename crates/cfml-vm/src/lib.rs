@@ -947,9 +947,44 @@ const STANDARD_LOG_NAMES: &[&str] = &[
 /// (should never happen — every field has Serialize).
 pub(crate) fn cfconfig_to_cfml(cfg: &cfml_config::RustCfmlConfig) -> CfmlValue {
     match serde_json::to_value(cfg) {
-        Ok(v) => json_value_to_cfml(v),
+        Ok(v) => {
+            let tree = json_value_to_cfml(v);
+            mark_tree_read_only(&tree);
+            tree
+        }
         Err(_) => CfmlValue::strukt(ValueMap::default()),
     }
+}
+
+/// Mark every struct in a CFML tree read-only. The `server.cfconfig` tree is
+/// shared server-wide (one instance for every request), so a write through it
+/// must be refused rather than silently become visible to every other request.
+fn mark_tree_read_only(v: &CfmlValue) {
+    match v {
+        CfmlValue::Struct(s) => {
+            for child in s.snapshot().values() {
+                mark_tree_read_only(child);
+            }
+            s.mark_read_only();
+        }
+        CfmlValue::Array(a) => {
+            for child in a.snapshot() {
+                mark_tree_read_only(&child);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// One shared `server.cfconfig` tree and the config it was built from, held on
+/// `ServerState::cfconfig_scope_cache`. The config is identified by its `Arc`
+/// address first (free, and stable in production where the per-app config is
+/// cached) and by its serialised form second (dev mode re-reads the per-app
+/// file every request, so a fresh `Arc` with identical contents must still hit).
+pub struct CfconfigScopeEntry {
+    ptr: usize,
+    json: String,
+    tree: CfmlValue,
 }
 
 /// Convert parsed JSON into a CFML value.
@@ -1966,6 +2001,15 @@ pub struct ServerState {
     /// Resolved `.cfconfig.json` (or defaults if no file). Wraps in `Arc` so
     /// every cloned ServerState shares the same struct without re-parsing.
     pub cfconfig: Arc<cfml_config::RustCfmlConfig>,
+    /// The CFML-visible `server.cfconfig` tree, built ONCE per distinct config
+    /// and shared by every request (see `CfmlVirtualMachine::cfconfig_scope_tree`).
+    /// Before this each request built its own ~50-container tree on the first
+    /// `server` read and parked it in the persistent server scope, where the
+    /// NEXT request's tree displaced it: alive at request end, dead one request
+    /// later, which is exactly the shape the cross-request survivor set holds
+    /// as a dead handle until its next compaction. On a Preside admin that was
+    /// ~50 dead shells per request, a 100+ MB sawtooth.
+    pub cfconfig_scope_cache: Arc<parking_lot::Mutex<Option<CfconfigScopeEntry>>>,
     /// `onSessionEnd` deliveries queued by the background reaper, keyed by the
     /// owning application name. The reaper drains expired session *data* off
     /// the request path (cleanup); the hook itself needs a live per-app VM
@@ -2038,6 +2082,7 @@ impl ServerState {
             static_scopes: Arc::new(parking_lot::RwLock::new(FxHashMap::default())),
             class_caches: Arc::new(parking_lot::RwLock::new(FxHashMap::default())),
             cfconfig,
+            cfconfig_scope_cache: Arc::new(parking_lot::Mutex::new(None)),
             pending_session_ends: Arc::new(Mutex::new(HashMap::new())),
             websocket: Arc::new(websocket::WebSocketRegistry::new(
                 uuid::Uuid::new_v4().to_string(),
@@ -25137,9 +25182,12 @@ impl CfmlVirtualMachine {
             Some(v) => Some(v),
             None => {
                 let built = if let Some(ref app_cfg) = self.app_cfconfig {
-                    Some(cfconfig_to_cfml(app_cfg))
+                    Some(self.cfconfig_scope_tree(app_cfg))
                 } else {
-                    self.server_state.as_ref().map(|ss| cfconfig_to_cfml(&ss.cfconfig))
+                    self.server_state
+                        .as_ref()
+                        .map(|ss| ss.cfconfig.clone())
+                        .map(|c| self.cfconfig_scope_tree(&c))
                 };
                 if let Some(ref v) = built {
                     *self.request_cfconfig_scope_memo.write() = Some((is_app, v.clone()));
@@ -25148,9 +25196,49 @@ impl CfmlVirtualMachine {
             }
         };
         if let Some(cfg) = cfg {
-            handle.insert("cfconfig".to_string(), cfg);
+            // The tree is shared across requests, so most reads find the very
+            // same struct already under the key; re-inserting it would only
+            // re-enter the displaced (identical) graph into the collector log.
+            let already = match (handle.get("cfconfig"), &cfg) {
+                (Some(CfmlValue::Struct(cur)), CfmlValue::Struct(new)) => cur.ptr_eq(new),
+                _ => false,
+            };
+            if !already {
+                handle.insert("cfconfig".to_string(), cfg);
+            }
         }
         handle
+    }
+
+    /// The shared `server.cfconfig` tree for `cfg` (see
+    /// `ServerState::cfconfig_scope_cache`). Built on the first request that
+    /// reads `server` and reused by every later one while the config is the
+    /// same; a changed config (a different `Arc` whose serialised form differs)
+    /// replaces it. Outside `--serve` (no `ServerState`) the tree is simply
+    /// built, as before.
+    fn cfconfig_scope_tree(&self, cfg: &Arc<cfml_config::RustCfmlConfig>) -> CfmlValue {
+        let Some(ss) = self.server_state.as_ref() else {
+            return cfconfig_to_cfml(cfg);
+        };
+        let ptr = Arc::as_ptr(cfg) as usize;
+        let mut guard = ss.cfconfig_scope_cache.lock();
+        if let Some(e) = guard.as_mut() {
+            if e.ptr == ptr {
+                return e.tree.clone();
+            }
+            let json = serde_json::to_string(&**cfg).unwrap_or_default();
+            if json == e.json {
+                e.ptr = ptr;
+                return e.tree.clone();
+            }
+            let tree = cfconfig_to_cfml(cfg);
+            *e = CfconfigScopeEntry { ptr, json, tree: tree.clone() };
+            return tree;
+        }
+        let json = serde_json::to_string(&**cfg).unwrap_or_default();
+        let tree = cfconfig_to_cfml(cfg);
+        *guard = Some(CfconfigScopeEntry { ptr, json, tree: tree.clone() });
+        tree
     }
 
     fn scope_aware_store(
