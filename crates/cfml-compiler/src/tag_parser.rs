@@ -4365,11 +4365,42 @@ fn extract_datasource_from_body(body: &str) -> Option<String> {
 // cfqueryparam scanning
 // -----------------------------------------------
 
+/// A boolean tag attribute: a literal (`null="true"`) is decided here, while
+/// one holding `#expr#` (`null="#len(x) EQ 0#"`) is evaluated when the query
+/// runs, as on Lucee.
+enum BoolAttr {
+    Literal(bool),
+    Expr(String),
+}
+
+impl BoolAttr {
+    fn parse(raw: Option<&String>) -> BoolAttr {
+        match raw {
+            Some(v) if v.contains('#') => BoolAttr::Expr(format_attr_value(v, true)),
+            Some(v) => BoolAttr::Literal(v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("yes")),
+            None => BoolAttr::Literal(false),
+        }
+    }
+
+    /// The script expression for a param struct's member.
+    fn to_script(&self) -> String {
+        match self {
+            BoolAttr::Literal(b) => b.to_string(),
+            BoolAttr::Expr(e) => format!("({})", e),
+        }
+    }
+
+    /// Known to be true before the query runs?
+    fn is_literal_true(&self) -> bool {
+        matches!(self, BoolAttr::Literal(true))
+    }
+}
+
 struct CfQueryParam {
     value_expr: String,  // The value expression (script-ready: variable ref or string literal)
     cfsqltype: String,
-    null: bool,
-    list: bool,
+    null: BoolAttr,
+    list: BoolAttr,
     separator: String,
     // Optional bare script expression supplied via `attributeCollection="#expr#"`.
     // When Some, the param item is built by overlaying the explicit attrs on top
@@ -4393,12 +4424,8 @@ fn parse_cfqueryparam_attrs(tag_attrs: &std::collections::HashMap<String, String
     let value_raw = tag_attrs.get("value").cloned().unwrap_or_default();
     let cfsqltype = tag_attrs.get("cfsqltype").cloned()
         .unwrap_or_else(|| "cf_sql_varchar".to_string());
-    let null = tag_attrs.get("null")
-        .map(|v| v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("yes"))
-        .unwrap_or(false);
-    let list = tag_attrs.get("list")
-        .map(|v| v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("yes"))
-        .unwrap_or(false);
+    let null = BoolAttr::parse(tag_attrs.get("null"));
+    let list = BoolAttr::parse(tag_attrs.get("list"));
     let separator = tag_attrs.get("separator").cloned().unwrap_or_else(|| ",".to_string());
 
     // attributeCollection="#expr#" — bare script expression that
@@ -4418,7 +4445,7 @@ fn parse_cfqueryparam_attrs(tag_attrs: &std::collections::HashMap<String, String
     });
 
     // Convert value to script expression
-    let value_expr = if null {
+    let value_expr = if null.is_literal_true() {
         "\"\"".to_string()
     } else if value_raw.is_empty() {
         "\"\"".to_string()
@@ -4472,10 +4499,10 @@ fn cfqueryparam_to_literal(p: &CfQueryParam) -> String {
             explicit.push(format!("cfsqltype: \"{}\"", p.cfsqltype));
         }
         if p.explicit_null {
-            explicit.push(format!("null: {}", p.null));
+            explicit.push(format!("null: {}", p.null.to_script()));
         }
         if p.explicit_list {
-            explicit.push(format!("list: {}", p.list));
+            explicit.push(format!("list: {}", p.list.to_script()));
         }
         if p.explicit_separator {
             explicit.push(format!("separator: \"{}\"", p.separator));
@@ -4496,11 +4523,13 @@ fn cfqueryparam_to_literal(p: &CfQueryParam) -> String {
         let mut parts = Vec::new();
         parts.push(format!("value: {}", p.value_expr));
         parts.push(format!("cfsqltype: \"{}\"", p.cfsqltype));
-        if p.null {
-            parts.push("null: true".to_string());
+        match &p.null {
+            BoolAttr::Literal(true) => parts.push("null: true".to_string()),
+            BoolAttr::Literal(false) => {}
+            expr => parts.push(format!("null: {}", expr.to_script())),
         }
-        if p.list {
-            parts.push("list: true".to_string());
+        if !matches!(p.list, BoolAttr::Literal(false)) {
+            parts.push(format!("list: {}", p.list.to_script()));
             if p.separator != "," {
                 parts.push(format!("separator: \"{}\"", p.separator));
             }
