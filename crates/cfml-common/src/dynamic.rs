@@ -211,10 +211,40 @@ impl<T: ProbeKey + ?Sized> ProbeKey for &T {
     }
 }
 
+/// Move a vector's elements into a fresh allocation sized exactly for them.
+/// The array counterpart of [`ValueMap::compact`], and for the same reason:
+/// mimalloc keeps the old block on a realloc that shrinks by less than half.
+pub(crate) fn compact_vec(vec: &mut Vec<CfmlValue>) {
+    if vec.capacity() > vec.len() {
+        let mut fresh = Vec::with_capacity(vec.len());
+        fresh.append(vec);
+        *vec = fresh;
+    }
+}
+
 impl ValueMap {
     #[inline]
     pub fn with_capacity_and_hasher(n: usize, _h: ValueBuildHasher) -> Self {
         ValueMap(RawValueMap::with_capacity_and_hasher(n, KeyBuildHasher::default()), 0)
+    }
+
+    /// Move the entries into freshly allocated storage sized exactly for them,
+    /// releasing the growth slack of a map built one insert at a time.
+    ///
+    /// Not `shrink_to_fit`: under mimalloc a realloc that shrinks a block by
+    /// less than half returns the SAME block, so `shrink_to_fit` on a 9-of-14
+    /// map frees nothing. Only a new allocation lands in the smaller size
+    /// class. Contents and order are unchanged; the hasher is an identity over
+    /// each `Key`'s stored hash, so re-inserting does no string hashing. Use it
+    /// on maps that will live long and rarely grow again.
+    pub fn compact(&mut self) {
+        let len = self.0.len();
+        if self.0.capacity() <= len {
+            return;
+        }
+        let mut fresh = RawValueMap::with_capacity_and_hasher(len, KeyBuildHasher::default());
+        fresh.extend(self.0.drain(..));
+        self.0 = fresh;
     }
 
     /// Monotonic mutation counter. Every `&mut` accessor on this type bumps it,
@@ -4535,6 +4565,13 @@ pub fn expand_list_param(value: &CfmlValue, separator: &str) -> Vec<CfmlValue> {
 /// names; longer strings are hints/paths and mostly unique), the pool is
 /// capped at 32,768 spellings (first come wins), and the walk is bounded by
 /// a visited set and a depth cap so a cyclic or adversarial graph terminates.
+///
+/// The same walk also RIGHT-SIZES every struct and array it visits. Metadata is
+/// built one key at a time, so each map carries IndexMap's growth slack (a
+/// 9-key function struct sits in 14 slots, a 1-key one in 3), and the class
+/// cache then keeps it for the life of the process. On a Preside admin the
+/// metadata builders owned ~65 MB of grown map entries. A later write simply
+/// regrows the map, so shrinking is invisible to callers.
 pub fn intern_metadata_string_values(v: &CfmlValue) {
     use std::collections::HashMap;
     use std::sync::{Mutex, OnceLock};
@@ -4561,6 +4598,7 @@ pub fn intern_metadata_string_values(v: &CfmlValue) {
                     for (_k, val) in m.iter_mut() {
                         intern_leaf(val, pool);
                     }
+                    m.compact();
                 });
                 // Recurse outside the write lock: a nested value is its own
                 // Arc, so the parent's lock need not be held while walking it.
@@ -4578,6 +4616,7 @@ pub fn intern_metadata_string_values(v: &CfmlValue) {
                     for val in vec.iter_mut() {
                         intern_leaf(val, pool);
                     }
+                    compact_vec(vec);
                 });
                 let items = a.with_read(|vec| vec.clone());
                 for val in items {
