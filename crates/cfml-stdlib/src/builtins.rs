@@ -2589,6 +2589,15 @@ fn url_encode_impl(s: &str, encoding: UrlEncoding) -> String {
 /// form-encoded (Java's URLEncoder: space as `+`), unless the param says
 /// `encoded="false"`. Raw, a value containing `&`, `=`, `+` or `%` split into
 /// extra fields or decoded to something else on the receiving end.
+/// A request body's bytes: a binary value is sent as-is (Lucee parity, e.g. a
+/// presigned S3/R2 PUT of `fileReadBinary(path)`), anything else as its string.
+fn cfhttp_body_bytes(v: &CfmlValue) -> Vec<u8> {
+    match v {
+        CfmlValue::Binary(b) => b.to_vec(),
+        other => other.as_string().into_bytes(),
+    }
+}
+
 fn cfhttp_encoded_pair(param: &cfml_common::dynamic::CfmlStruct, name: &str, value: &str) -> String {
     let encode = param
         .data_get("encoded")
@@ -10056,7 +10065,7 @@ fn fn_cfhttp(args: Vec<CfmlValue>) -> CfmlResult {
                 }
             }
             // Explicit body attr (string) — wins over param-built body.
-            let explicit_body: Option<Vec<u8>> = opts.data_get("body").and_then(|v| if matches!(v, CfmlValue::Null) { None } else { Some(v.as_string().into_bytes()) });
+            let explicit_body: Option<Vec<u8>> = opts.data_get("body").and_then(|v| if matches!(v, CfmlValue::Null) { None } else { Some(cfhttp_body_bytes(&v)) });
 
             // Multipart attr: true/yes/"true"/"yes" → opt-in. A type="file"
             // cfhttpparam also forces multipart (Lucee parity — you can't send
@@ -10169,14 +10178,15 @@ fn fn_cfhttp(args: Vec<CfmlValue>) -> CfmlResult {
                                 let pvalue = p.data_get("value").map(|v| v.as_string()).unwrap_or_default();
                                 match ptype.as_str() {
                                     "formfield" => form_parts.push(cfhttp_encoded_pair(&p, &pname, &pvalue)),
-                                    "body" => xml_body = Some(pvalue),
-                                    "xml" => xml_body = Some(pvalue),
+                                    "body" | "xml" => {
+                                        xml_body = p.data_get("value").map(|v| cfhttp_body_bytes(&v))
+                                    }
                                     _ => {}
                                 }
                             }
                         }
                         if let Some(xml) = xml_body {
-                            Some(xml.into_bytes())
+                            Some(xml)
                         } else if !form_parts.is_empty() {
                             hdrs.entry("Content-Type".to_string()).or_insert("application/x-www-form-urlencoded".to_string());
                             Some(form_parts.join("&").into_bytes())
