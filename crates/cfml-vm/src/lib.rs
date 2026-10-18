@@ -15198,7 +15198,18 @@ impl CfmlVirtualMachine {
                                 // must never replace it.
                                 let nonquery_over_query = matches!(&cur_val, Some(CfmlValue::Query(_)))
                                     && !matches!(&result, CfmlValue::Query(_));
-                                if !clobbers_cfc && !bool_over_struct && !shim_over_nonshim && !nonquery_over_query {
+                                // GH #492: a native extension object is a reference
+                                // handle that changes in place, so it never needs a
+                                // value write-back. Without this, a chain ending in a
+                                // `set*`-named call (`br.newPage().settle(100)`)
+                                // stored the Page over `br`.
+                                let over_native = matches!(&cur_val, Some(CfmlValue::NativeObject(_)))
+                                    && !matches!(
+                                        (&cur_val, &result),
+                                        (Some(CfmlValue::NativeObject(a)), CfmlValue::NativeObject(b))
+                                            if std::sync::Arc::ptr_eq(a, b)
+                                    );
+                                if !clobbers_cfc && !bool_over_struct && !shim_over_nonshim && !nonquery_over_query && !over_native {
                                     self.scope_aware_store(var_name, result.clone(), &mut locals, effective_local_mode_modern);
                                 } else if bool_over_struct
                                     && !cur_is_cfc
@@ -15251,6 +15262,16 @@ impl CfmlVirtualMachine {
                                         }
                                     }
                                     if reached {
+                                        // See `over_native` above (GH #492).
+                                        if matches!(&node, CfmlValue::NativeObject(_))
+                                            && !matches!(
+                                                (&node, &result),
+                                                (CfmlValue::NativeObject(a), CfmlValue::NativeObject(b))
+                                                    if std::sync::Arc::ptr_eq(a, b)
+                                            )
+                                        {
+                                            skip_for_identity = true;
+                                        }
                                         // See `nonquery_over_query` above.
                                         if matches!(&node, CfmlValue::Query(_))
                                             && !matches!(&result, CfmlValue::Query(_))
