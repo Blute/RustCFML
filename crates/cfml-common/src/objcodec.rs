@@ -82,13 +82,13 @@ fn enc(v: &CfmlValue, out: &mut Vec<u8>, depth: usize) -> Result<(), String> {
                 enc(e, out, depth + 1)?;
             }
         }
-        CfmlValue::QueryColumn(cells, _) => {
-            out.push(T_ARRAY);
-            put_len(out, cells.len());
-            for e in cells.iter() {
-                enc(e, out, depth + 1)?;
-            }
-        }
+        // A bare `q.col` reference stored in a struct is a string proxy for the
+        // current row's cell (Lucee treats it as that scalar wherever it is
+        // used), so it serialises as that scalar — never as the whole column.
+        // Preside's full-page cache hit this: a dummy site-tree page built from
+        // `id = resourceDetail.id` came back from objectLoad() with an id of
+        // `["..."]`, and every cached request failed in getCurrentPageId().
+        v @ CfmlValue::QueryColumn(..) => enc(v.query_column_scalar(), out, depth)?,
         CfmlValue::Struct(m) => encode_map(&m.snapshot(), out, depth)?,
         CfmlValue::Query(q) => {
             let backing = q.backing();
@@ -348,6 +348,27 @@ mod tests {
 
         let dt = CfmlValue::DateTime(crate::datetime::CfmlDate::from_epoch(1_700_000_000, 123_456_789));
         assert_eq!(format!("{:?}", round_trip(&dt)), format!("{dt:?}"));
+    }
+
+    #[test]
+    fn query_column_proxy_saves_as_its_current_row_scalar() {
+        // `holder = { id = q.id }` stores a QueryColumn proxy; Lucee serialises it
+        // as the current row's string, never as the whole column.
+        let cells: Arc<Vec<CfmlValue>> = Arc::new(vec![CfmlValue::string("first"), CfmlValue::string("second")]);
+        let mut m = ValueMap::default();
+        m.insert("id".to_string(), CfmlValue::QueryColumn(cells.clone(), 1));
+        let back = round_trip(&CfmlValue::strukt(m));
+        let CfmlValue::Struct(s) = back else { panic!("struct") };
+        match s.get("id").unwrap() {
+            CfmlValue::String(v) => assert_eq!(v.as_str(), "second", "the row the proxy points at"),
+            other => panic!("expected a string, got {other:?}"),
+        }
+        // A proxy whose row is past the end falls back to the first row, as the
+        // scalar accessor does everywhere else.
+        let mut m = ValueMap::default();
+        m.insert("id".to_string(), CfmlValue::QueryColumn(cells, 9));
+        let CfmlValue::Struct(s) = round_trip(&CfmlValue::strukt(m)) else { panic!("struct") };
+        assert_eq!(s.get("id").unwrap().as_string(), "first");
     }
 
     #[test]
