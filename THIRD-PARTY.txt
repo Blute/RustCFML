@@ -69,7 +69,7 @@ Dependencies
   ab_glyph_rasterizer 0.1.10 — https://github.com/alexheretic/ab-glyph
   aws-config 1.8.18 — https://github.com/smithy-lang/smithy-rs
   aws-credential-types 1.2.14 — https://github.com/smithy-lang/smithy-rs
-  aws-lc-sys 0.42.0 — https://github.com/aws/aws-lc-rs
+  aws-lc-sys 0.46.0 — https://github.com/aws/aws-lc-rs
   aws-runtime 1.7.5 — https://github.com/smithy-lang/smithy-rs
   aws-sigv4 1.4.5 — https://github.com/smithy-lang/smithy-rs
   aws-smithy-async 1.2.14 — https://github.com/smithy-lang/smithy-rs
@@ -126,7 +126,7 @@ Dependencies
   lebe 0.5.3 — https://github.com/johannesvollmer/lebe
 [BSD-3-Clause]
   alloc-stdlib 0.2.4 — https://github.com/dropbox/rust-alloc-no-stdlib
-  aws-lc-sys 0.42.0 — https://github.com/aws/aws-lc-rs
+  aws-lc-sys 0.46.0 — https://github.com/aws/aws-lc-rs
   exr 1.74.0 — https://github.com/johannesvollmer/exrs
 [BSD-3-Clause]
   encoding_rs 0.8.35 — https://github.com/hsivonen/encoding_rs
@@ -142,10 +142,10 @@ Dependencies
 [ISC]
   ego-tree 0.10.0 — https://github.com/rust-scraper/ego-tree
 [ISC]
-  rustls-webpki 0.103.13 — https://github.com/rustls/webpki
+  rustls-webpki 0.103.16 — https://github.com/rustls/webpki
 [ISC]
-  aws-lc-rs 1.17.1 — https://github.com/aws/aws-lc-rs
-  aws-lc-sys 0.42.0 — https://github.com/aws/aws-lc-rs
+  aws-lc-rs 1.18.2 — https://github.com/aws/aws-lc-rs
+  aws-lc-sys 0.46.0 — https://github.com/aws/aws-lc-rs
   scraper 0.22.0 — https://github.com/causal-agent/scraper
 [MIT]
   blowfish 0.9.1 — https://github.com/RustCrypto/block-ciphers
@@ -306,7 +306,7 @@ Dependencies
 [MIT]
   hyper-rustls 0.27.9 — https://github.com/rustls/hyper-rustls
   rustls-native-certs 0.8.4 — https://github.com/rustls/rustls-native-certs
-  rustls 0.23.41 — https://github.com/rustls/rustls
+  rustls 0.23.45 — https://github.com/rustls/rustls
 [MIT]
   httpdate 1.0.3 — https://github.com/pyfisch/httpdate
 [MIT]
@@ -945,7 +945,7 @@ Dependencies
 [MIT]
   data-encoding 2.11.0 — https://github.com/ia0/data-encoding
 [MIT]
-  aws-lc-sys 0.42.0 — https://github.com/aws/aws-lc-rs
+  aws-lc-sys 0.46.0 — https://github.com/aws/aws-lc-rs
 [MIT]
   derive_more-impl 2.1.1 — https://github.com/JelteF/derive_more
   derive_more 0.99.20 — https://github.com/JelteF/derive_more
@@ -3400,7 +3400,7 @@ Applies to:
   - ab_glyph_rasterizer 0.1.10
   - aws-config 1.8.18
   - aws-credential-types 1.2.14
-  - aws-lc-sys 0.42.0
+  - aws-lc-sys 0.46.0
   - aws-runtime 1.7.5
   - aws-sigv4 1.4.5
   - aws-smithy-async 1.2.14
@@ -3960,7 +3960,7 @@ BSD 3-Clause "New" or "Revised" License (BSD-3-Clause)
 
 Applies to:
   - alloc-stdlib 0.2.4
-  - aws-lc-sys 0.42.0
+  - aws-lc-sys 0.46.0
   - exr 1.74.0
 ================================================================================
 
@@ -4167,7 +4167,7 @@ OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 ISC License (ISC)
 
 Applies to:
-  - rustls-webpki 0.103.13
+  - rustls-webpki 0.103.16
 ================================================================================
 
 Except as otherwise noted, this project is licensed under the following
@@ -4194,8 +4194,8 @@ third-party/chromium/LICENSE.
 ISC License (ISC)
 
 Applies to:
-  - aws-lc-rs 1.17.1
-  - aws-lc-sys 0.42.0
+  - aws-lc-rs 1.18.2
+  - aws-lc-sys 0.46.0
   - scraper 0.22.0
 ================================================================================
 
@@ -5628,7 +5628,7 @@ MIT License (MIT)
 Applies to:
   - hyper-rustls 0.27.9
   - rustls-native-certs 0.8.4
-  - rustls 0.23.41
+  - rustls 0.23.45
 ================================================================================
 
 Copyright (c) 2016 Joseph Birr-Pixton <jpixton@gmail.com>
@@ -12135,7 +12135,7 @@ SOFTWARE.
 MIT License (MIT)
 
 Applies to:
-  - aws-lc-sys 0.42.0
+  - aws-lc-sys 0.46.0
 ================================================================================
 
 The MIT License (MIT)
