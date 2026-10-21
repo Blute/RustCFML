@@ -345,6 +345,7 @@ include "harness.cfm";
 <cf_runtest file="stdlib/test_encrypt_lucee_vectors.cfm" />
 <cf_runtest file="stdlib/test_password_hashing.cfm" />
 <cf_runtest file="stdlib/test_xml.cfm" />
+<cf_runtest file="stdlib/test_nesting_limits.cfm" rustcfmlOnly="true" why="Lucee has no fixed JSON/XML depth limit (it runs until the JVM stack overflows), so inputs just over RustCFML's 512/1024 limits do not throw there" />
 <cf_runtest file="stdlib/test_utility.cfm" />
 <cf_runtest file="stdlib/test_encoding_functions.cfm" />
 <cf_runtest file="stdlib/test_url_encoder_policies.cfm" />
@@ -688,6 +689,7 @@ include "harness.cfm";
 <cf_runtest file="tags/test_mapping_dotdot_normalization.cfm" />
 <cf_runtest file="tags/test_cfdirectory_attrcoll_name.cfm" />
 <cf_runtest file="tags/test_cffile_script_form.cfm" />
+<cf_runtest file="tags/test_cffile_upload_accept.cfm" rustcfmlOnly="true" why="the upload parts are synthesised as form.<field> structs; Lucee reads its own FormItems and ignores those" />
 <cf_runtest file="tags/test_cfhttpparam_runtime_body.cfm" />
 <cf_runtest file="tags/test_http_script_body_runtime.cfm" />
 <cf_runtest file="tags/test_cfmail_runtime_body.cfm" />
@@ -712,6 +714,7 @@ include "harness.cfm";
 <cf_runtest file="tags/test_static_conditional_get.cfm" />
 <cf_runtest file="tags/test_cfcookie_path_samesite.cfm" />
 <cf_runtest file="tags/test_cfcookie_inrequest_readback.cfm" />
+<cf_runtest file="tags/test_cfheader_validation.cfm" rustcfmlOnly="true" why="Lucee hands statusCode/header values straight to the servlet container and does not throw at the tag for statusCode=1000 or a CR/LF value" />
 <cf_runtest file="tags/test_tags_cfhttp_interpolation.cfm" />
 <cf_runtest file="tags/test_cfhttp_attribute_collection.cfm" />
 <cf_runtest file="tags/test_tags_cfhttp_name_file.cfm" />
@@ -1060,6 +1063,11 @@ include "harness.cfm";
 <cf_runtest file="core/test_switch_fallthrough.cfm" />
 <cf_runtest file="core/test_cfloop_list_item_with_index.cfm" />
 <cf_runtest file="core/test_switch_continue_in_loop.cfm" />
+<!--- - engine_temps_not_in_variables: GH #493, the hidden variables of switch, file
+     loops, cfmail/cfstoredproc/cfinvoke bodies, savecontent and script loops leaked
+     into a shared component's variables scope and raced across requests. --->
+<cf_runtest file="core/test_engine_temps_not_in_variables.cfm" />
+<cf_runtest file="core/test_engine_temps_savecontent_novar.cfm" rustcfmlOnly="true" />
 <cf_runtest file="core/test_application_scope_persist.cfm" />
 <cf_runtest file="core/test_application_name_implicit.cfm" />
 <cf_runtest file="core/test_session_scope_persist.cfm" />

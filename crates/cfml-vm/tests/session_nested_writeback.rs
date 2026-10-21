@@ -113,8 +113,30 @@ const PAGE: &str = r#"<cfscript>
 </cfscript>"#;
 
 /// Run one request against a caller-supplied store + session id, executing the
-/// given CFML page body.
+/// given CFML page body. The id is made KNOWN to the store first: an id the
+/// store has never issued is not adopted (session fixation), and these tests
+/// are about persisting an established session, not minting one.
 fn run_request(store: Arc<dyn SessionStore>, sid: &str, page: &str) {
+    if !store.contains("session-nested-writeback-test", sid) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        store.set(
+            "session-nested-writeback-test",
+            sid,
+            SessionData {
+                variables: ValueMap::default(),
+                created_secs: now,
+                last_accessed_secs: now,
+                auth_user: None,
+                auth_roles: Vec::new(),
+                timeout_secs: 3600,
+                app_name: "session-nested-writeback-test".to_string(),
+                live: None,
+            },
+        );
+    }
     let mut files: HashMap<String, Vec<u8>> = HashMap::new();
     files.insert("Application.cfc".to_string(), APP.as_bytes().to_vec());
     files.insert("index.cfm".to_string(), page.as_bytes().to_vec());
@@ -161,7 +183,7 @@ fn run_request(store: Arc<dyn SessionStore>, sid: &str, page: &str) {
 
 /// The `auth` sub-struct out of a persisted `SessionData`.
 fn auth_struct(data: &SessionData) -> Option<ValueMap> {
-    data.variables
+    data.variables_snapshot()
         .iter()
         .find(|(k, _)| k.eq_ignore_ascii_case("auth"))
         .and_then(|(_, v)| v.as_struct())

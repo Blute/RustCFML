@@ -35,6 +35,7 @@ mod intercepts_extensions;
 mod intercepts_deferred;
 mod intercepts_querydir;
 mod intercepts_objectio;
+mod intercepts_upload;
 mod intercepts_varpath;
 mod intercepts_output;
 mod intercepts_realtime;
@@ -497,6 +498,29 @@ pub struct SessionData {
     /// records (datasource/cluster stores) deserialise with `""`.
     #[serde(default)]
     pub app_name: String,
+    /// The ONE live session struct every concurrent request of this session
+    /// shares — what Lucee hands out. Set by the in-process `MemoryStore` the
+    /// first time a record is read, after which `variables` is empty and this
+    /// handle is the truth. Before it, each request copied `variables` into a
+    /// private struct and wrote the whole map back at the end, so two requests
+    /// in one session lost each other's writes: a slow request's `session.a =`
+    /// overwrote a fast one's `session.b =` (proven under `--serve`). The
+    /// serialising stores (datasource, memcached, cluster) cannot hold a live
+    /// handle; they stay on their documented last-write-wins whole-blob model,
+    /// which is also how Lucee's external session storage behaves.
+    #[serde(skip)]
+    pub live: Option<CfmlStruct>,
+}
+
+impl SessionData {
+    /// The session's variables as a plain map: a snapshot of the live struct
+    /// when one exists, otherwise the stored map.
+    pub fn variables_snapshot(&self) -> ValueMap {
+        match &self.live {
+            Some(h) => h.snapshot(),
+            None => self.variables.clone(),
+        }
+    }
 }
 
 /// True when a struct carries CFC instance markers — this engine materialises
@@ -4868,15 +4892,19 @@ fn is_reference_value(v: &CfmlValue) -> bool {
 }
 
 fn is_engine_frame_local(name: &str) -> bool {
-    name.eq_ignore_ascii_case("__cfquery_params")
-        || name.eq_ignore_ascii_case("__cfhttp_params")
-        // Same accumulator shape, same hazard: `<cfstoredproc>`/`storedproc{}`
-        // and `<cfzip>`/`cfzip(){}` seed an array their child tags append to.
-        // Left in the component `variables` scope they were both shared by every
-        // thread holding the instance (GH #362) and visible to user code after
-        // the call.
-        || name.eq_ignore_ascii_case("__cfproc_params")
-        || name.eq_ignore_ascii_case("__cfzip_params")
+    // Every name the tag/script lowerings synthesise under the reserved `__cf`
+    // prefix, plus the capture target a `savecontent` without `variable=`
+    // writes. This was a four-name list (`__cfquery_params`, `__cfhttp_params`,
+    // `__cfproc_params`, `__cfzip_params` — GH #362) and the SAME hazard was
+    // then found on eleven more lowerings (GH #493 audit: `__cfexec_tmp`,
+    // `__cfmail_*`, `__cfproc_placeholders`, `__cfinvoke_args`, the script
+    // `loop` temporaries, `__savecontent_result`): on a component instance
+    // shared between requests, every concurrent call read and wrote ONE copy.
+    // The lowerings now declare their temporaries `var`; this is the safety
+    // net for the next one that forgets to.
+    let b = name.as_bytes();
+    (b.len() > 4 && b[0] == b'_' && b[1] == b'_' && b[2].eq_ignore_ascii_case(&b'c') && b[3].eq_ignore_ascii_case(&b'f'))
+        || name.eq_ignore_ascii_case("__savecontent_result")
 }
 
 impl CfmlVirtualMachine {
@@ -9217,6 +9245,18 @@ impl CfmlVirtualMachine {
         if depth > 2500 {
             return Err(self.wrap_error(CfmlError::runtime(format!(
                 "Call stack overflow (depth {})",
+                depth
+            ))));
+        }
+        // The frame ceiling is not enough on its own: a native frame's size
+        // depends on the build (a debug `execute_function_with_args` frame is
+        // hundreds of KB, so 64 MB held fewer than 256 CFML frames there) and
+        // on what the frame calls into. A native overflow is an ABORT of the
+        // whole process, so also refuse the call when the thread's stack is
+        // nearly exhausted (see `cfml_common::stack_guard`).
+        if !cfml_common::stack_guard::has_headroom(cfml_common::stack_guard::CALL_RED_ZONE) {
+            return Err(self.wrap_error(CfmlError::runtime(format!(
+                "Call stack overflow: the native stack is exhausted at call depth {} (the thread's stack is too small for this recursion)",
                 depth
             ))));
         }
@@ -17400,6 +17440,13 @@ impl CfmlVirtualMachine {
                 }
             }
 
+            if intercepts_upload::handles(&name_lower) {
+                match self.dispatch_upload(&name_lower, args.clone()) {
+                    Err(e) if intercepts_common::is_unhandled(&e) => {} // fall through
+                    other => return other,
+                }
+            }
+
             // Reflective variable paths need the CALLING frame's scope chain, so
             // they take `parent_locals` on top of the usual (name, args).
             // Introspection that must include loaded extensions.
@@ -20963,19 +21010,42 @@ impl CfmlVirtualMachine {
                     if let Some(CfmlValue::Struct(opts)) = args.get(0) {
                         if let Some(code_val) = opts.data_get("statuscode")
                         {
-                            let code = match &code_val {
-                                CfmlValue::Int(n) => *n as u16,
-                                CfmlValue::String(s) => s.parse::<u16>().unwrap_or(200),
-                                CfmlValue::Double(d) => *d as u16,
-                                _ => 200,
+                            // Validated (100-599) so an attribute like
+                            // `statusCode="1000"` throws here instead of failing
+                            // the server's response builder (which panicked).
+                            let raw = match &code_val {
+                                CfmlValue::Int(n) => *n,
+                                CfmlValue::Double(d) => *d as i64,
+                                other => {
+                                    let s = other.as_string();
+                                    match s.trim().parse::<f64>() {
+                                        Ok(d) => d as i64,
+                                        Err(_) => {
+                                            return Err(self.wrap_error(CfmlError::new(
+                                                format!("cfheader: statusCode [{}] is not a number", s),
+                                                CfmlErrorType::Application,
+                                            )));
+                                        }
+                                    }
+                                }
                             };
+                            let code = web::validate_status_code(raw, "cfheader")
+                                .map_err(|e| self.wrap_error(e))?;
                             let text = opts.data_get("statustext").map(|v| v.as_string())
                                 .unwrap_or_else(|| "OK".to_string());
+                            web::validate_header_value("statusText", &text, "cfheader")
+                                .map_err(|e| self.wrap_error(e))?;
                             self.response_status = Some((code, text));
                         } else if let Some(name_val) = opts.data_get("name").map(|v| v.as_string())
                         {
                             let value = opts.data_get("value").map(|v| v.as_string())
                                 .unwrap_or_default();
+                            // Name must be a token, value free of CR/LF — see
+                            // `web::validate_header_value` (response splitting).
+                            web::validate_header_name(&name_val, "cfheader")
+                                .map_err(|e| self.wrap_error(e))?;
+                            web::validate_header_value(&name_val, &value, "cfheader")
+                                .map_err(|e| self.wrap_error(e))?;
                             self.response_headers.push((name_val, value));
                         }
                     }
@@ -21008,6 +21078,8 @@ impl CfmlVirtualMachine {
                             // getContentType() missed it, returned the hardcoded
                             // text/html default, and re-applied that — so a served
                             // static asset (image/png) came back as text/html.
+                            web::validate_header_value("Content-Type", &ct, "cfcontent")
+                                .map_err(|e| self.wrap_error(e))?;
                             self.response_headers
                                 .retain(|(n, _)| !n.eq_ignore_ascii_case("content-type"));
                             self.response_headers
@@ -21130,13 +21202,18 @@ impl CfmlVirtualMachine {
                         CfmlErrorType::Application,
                     )
                     .map_err(|e| self.wrap_error(e))?;
-                    let to_status = |v: &CfmlValue| -> u16 {
-                        match v {
-                            CfmlValue::Int(n) => *n as u16,
-                            CfmlValue::String(s) => s.parse::<u16>().unwrap_or(302),
-                            CfmlValue::Double(d) => *d as u16,
-                            _ => 302,
-                        }
+                    // Out-of-range codes throw (see `web::validate_status_code`);
+                    // a non-numeric / empty value keeps the 302 default.
+                    let to_status = |v: &CfmlValue| -> Result<u16, CfmlError> {
+                        let raw = match v {
+                            CfmlValue::Int(n) => *n,
+                            CfmlValue::Double(d) => *d as i64,
+                            other => match other.as_string().trim().parse::<f64>() {
+                                Ok(d) => d as i64,
+                                Err(_) => return Ok(302),
+                            },
+                        };
+                        web::validate_status_code(raw, "cflocation")
                     };
                     // Two call shapes reach here: the tag / named-arg form bundles
                     // a single options struct `{url, statusCode, addToken}`; the
@@ -21146,14 +21223,19 @@ impl CfmlVirtualMachine {
                         Some(CfmlValue::Struct(opts)) => {
                             let url = opts.data_get("url").map(|v| v.as_string())
                                 .unwrap_or_default();
-                            let status_code = opts.data_get("statuscode").map(|v| to_status(&v))
-                                .unwrap_or(302);
+                            let status_code = match opts.data_get("statuscode") {
+                                Some(v) => to_status(&v).map_err(|e| self.wrap_error(e))?,
+                                None => 302,
+                            };
                             (url, status_code)
                         }
                         Some(url_val) => {
                             // Positional: Location(url, addToken, statusCode).
                             let url = url_val.as_string();
-                            let status_code = args.get(2).map(to_status).unwrap_or(302);
+                            let status_code = match args.get(2) {
+                                Some(v) => to_status(v).map_err(|e| self.wrap_error(e))?,
+                                None => 302,
+                            };
                             (url, status_code)
                         }
                         None => return Ok(CfmlValue::Null),
@@ -21161,6 +21243,10 @@ impl CfmlVirtualMachine {
                     if url.is_empty() {
                         return Ok(CfmlValue::Null);
                     }
+                    // The URL becomes the `Location` header: a CR/LF in it is
+                    // header injection and used to panic the server worker.
+                    web::validate_redirect_url(&url, "cflocation")
+                        .map_err(|e| self.wrap_error(e))?;
                     self.redirect_url = Some(url.clone());
                     self.response_headers.push(("Location".to_string(), url));
                     self.response_status = Some((status_code, "Found".to_string()));
@@ -22385,6 +22471,13 @@ impl CfmlVirtualMachine {
                             .unwrap_or_default();
                         let value = opts.get("value").map(|v| v.as_string())
                             .unwrap_or_default();
+                        // Every attribute is spliced into one `Set-Cookie` line:
+                        // a CR/LF in any of them is header injection (and used
+                        // to panic the server worker). Throws a CFML error.
+                        web::validate_cookie_attr("name", &name)
+                            .map_err(|e| self.wrap_error(e))?;
+                        web::validate_cookie_attr("value", &value)
+                            .map_err(|e| self.wrap_error(e))?;
                         let mut cookie = format!("{}={}", name, value);
                         if let Some(expires) = opts.get("expires")
                         {
@@ -22395,12 +22488,17 @@ impl CfmlVirtualMachine {
                         }
                         if let Some(domain) = opts.get("domain")
                         {
-                            cookie.push_str(&format!("; Domain={}", domain.as_string()));
+                            let domain = domain.as_string();
+                            web::validate_cookie_attr("domain", &domain)
+                                .map_err(|e| self.wrap_error(e))?;
+                            cookie.push_str(&format!("; Domain={}", domain));
                         }
                         // Lucee defaults an omitted path to "/" so the cookie is
                         // site-wide rather than scoped to the request directory.
                         let path = opts.get("path").map(|v| v.as_string())
                             .unwrap_or_else(|| "/".to_string());
+                        web::validate_cookie_attr("path", &path)
+                            .map_err(|e| self.wrap_error(e))?;
                         cookie.push_str(&format!("; Path={}", path));
                         if let Some(samesite) = opts.get("samesite")
                         {
@@ -22448,176 +22546,6 @@ impl CfmlVirtualMachine {
                         }
                     }
                     return Ok(CfmlValue::Null);
-                }
-                "fileupload" | "__cffile_upload" => {
-                    // fileUpload(destination, formField, accept, nameConflict)
-                    let destination = args.get(0).map(|v| v.as_string()).unwrap_or_default();
-                    let form_field = args.get(1).map(|v| v.as_string()).unwrap_or_default();
-                    let _accept = args.get(2).map(|v| v.as_string()).unwrap_or_default();
-                    let name_conflict = args
-                        .get(3)
-                        .map(|v| v.as_string().to_lowercase())
-                        .unwrap_or_else(|| "error".to_string());
-
-                    // Look up the form field to find uploaded file info
-                    let form_scope = self
-                        .globals
-                        .get("form")
-                        .cloned()
-                        .unwrap_or(CfmlValue::strukt(ValueMap::default()));
-
-                    if let CfmlValue::Struct(form) = form_scope {
-                        let field_lower = form_field.to_lowercase();
-                        if let Some(CfmlValue::Struct(file_info)) = form.data_get(&field_lower)
-                        {
-                            let temp_path = file_info.data_get("tempfilepath").map(|v| v.as_string())
-                                .unwrap_or_default();
-                            let client_file = file_info.data_get("clientfile").map(|v| v.as_string())
-                                .unwrap_or_default();
-
-                            if !temp_path.is_empty() {
-                                let dest_dir = std::path::Path::new(&destination);
-                                let _ = std::fs::create_dir_all(dest_dir);
-                                let dest_file = dest_dir.join(&client_file);
-
-                                let final_path =
-                                    if dest_file.exists() && name_conflict == "makeunique" {
-                                        let stem = dest_file
-                                            .file_stem()
-                                            .map(|s| s.to_string_lossy().to_string())
-                                            .unwrap_or_default();
-                                        let ext = dest_file
-                                            .extension()
-                                            .map(|s| format!(".{}", s.to_string_lossy()))
-                                            .unwrap_or_default();
-                                        let unique = dest_dir.join(format!(
-                                            "{}_{}{}",
-                                            stem,
-                                            cfml_common::clock::now_unix_millis(),
-                                            ext
-                                        ));
-                                        unique
-                                    } else {
-                                        dest_file
-                                    };
-
-                                match std::fs::copy(&temp_path, &final_path) {
-                                    Ok(_) => {
-                                        let _ = std::fs::remove_file(&temp_path);
-                                        let mut result = file_info.snapshot();
-                                        result.insert(
-                                            "serverDirectory".to_string(),
-                                            CfmlValue::string(destination),
-                                        );
-                                        result.insert(
-                                            "serverFile".to_string(),
-                                            CfmlValue::string(
-                                                final_path
-                                                    .file_name()
-                                                    .unwrap_or_default()
-                                                    .to_string_lossy()
-                                                    .to_string(),
-                                            ),
-                                        );
-                                        result.insert(
-                                            "fileWasSaved".to_string(),
-                                            CfmlValue::Bool(true),
-                                        );
-                                        return Ok(CfmlValue::strukt(result));
-                                    }
-                                    Err(e) => {
-                                        return Err(CfmlError::runtime(format!(
-                                            "fileUpload: {}",
-                                            e
-                                        )))
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    return Err(CfmlError::runtime(format!(
-                        "fileUpload: form field '{}' not found or no file uploaded",
-                        form_field
-                    )));
-                }
-                "fileuploadall" => {
-                    // fileUploadAll(destination, accept, nameConflict)
-                    let destination = args.get(0).map(|v| v.as_string()).unwrap_or_default();
-                    let _accept = args.get(1).map(|v| v.as_string()).unwrap_or_default();
-                    let name_conflict = args
-                        .get(2)
-                        .map(|v| v.as_string().to_lowercase())
-                        .unwrap_or_else(|| "error".to_string());
-
-                    let form_scope = self
-                        .globals
-                        .get("form")
-                        .cloned()
-                        .unwrap_or(CfmlValue::strukt(ValueMap::default()));
-
-                    let mut results = Vec::new();
-                    if let CfmlValue::Struct(form) = form_scope {
-                        for (_, val) in form.iter() {
-                            if let CfmlValue::Struct(file_info) = val {
-                                let temp_path = file_info.data_get("tempfilepath").map(|v| v.as_string())
-                                    .unwrap_or_default();
-                                if temp_path.is_empty() {
-                                    continue;
-                                }
-
-                                let client_file = file_info.data_get("clientfile").map(|v| v.as_string())
-                                    .unwrap_or_default();
-
-                                let dest_dir = std::path::Path::new(&destination);
-                                let _ = std::fs::create_dir_all(dest_dir);
-                                let dest_file = dest_dir.join(&client_file);
-
-                                let final_path =
-                                    if dest_file.exists() && name_conflict == "makeunique" {
-                                        let stem = dest_file
-                                            .file_stem()
-                                            .map(|s| s.to_string_lossy().to_string())
-                                            .unwrap_or_default();
-                                        let ext = dest_file
-                                            .extension()
-                                            .map(|s| format!(".{}", s.to_string_lossy()))
-                                            .unwrap_or_default();
-                                        let unique = dest_dir.join(format!(
-                                            "{}_{}{}",
-                                            stem,
-                                            cfml_common::clock::now_unix_millis(),
-                                            ext
-                                        ));
-                                        unique
-                                    } else {
-                                        dest_file
-                                    };
-
-                                if let Ok(_) = std::fs::copy(&temp_path, &final_path) {
-                                    let _ = std::fs::remove_file(&temp_path);
-                                    let mut result = file_info.snapshot();
-                                    result.insert(
-                                        "serverDirectory".to_string(),
-                                        CfmlValue::string(destination.clone()),
-                                    );
-                                    result.insert(
-                                        "serverFile".to_string(),
-                                        CfmlValue::string(
-                                            final_path
-                                                .file_name()
-                                                .unwrap_or_default()
-                                                .to_string_lossy()
-                                                .to_string(),
-                                        ),
-                                    );
-                                    result
-                                        .insert("fileWasSaved".to_string(), CfmlValue::Bool(true));
-                                    results.push(CfmlValue::strukt(result));
-                                }
-                            }
-                        }
-                    }
-                    return Ok(CfmlValue::array(results));
                 }
                 "sessioninvalidate" => {
                     if let (Some(ref state), Some(ref sid)) = (&self.server_state, &self.session_id)
@@ -22843,6 +22771,7 @@ impl CfmlVirtualMachine {
                             auth_roles: Vec::new(),
                             timeout_secs: 1800,
                             app_name: app.clone(),
+                            live: None,
                         });
                         session.auth_user = Some(name);
                         session.auth_roles = roles;
@@ -26393,6 +26322,9 @@ impl CfmlVirtualMachine {
         let tag = tag.trim_start_matches("__");
         match tag.to_lowercase().as_str() {
             "cfhttp" => &["result"],
+            // cffile's read actions name their target with `variable`; the
+            // upload actions with `result` (Lucee), which is not an option.
+            "cffile" => &["name", "variable", "result"],
             // cfadmin names its output variable `returnVariable` — the whole
             // point of a read action (`action="getDebug" returnVariable="s"`).
             "cfadmin" => &["returnvariable"],
@@ -27793,7 +27725,9 @@ impl CfmlVirtualMachine {
             "setstatus" => {
                 let code = args.first().and_then(to_number).unwrap_or(200.0);
                 let text = args.get(1).map(|v| v.as_string()).unwrap_or_default();
-                self.response_status = Some((code as u16, text));
+                let code = web::validate_status_code(code as i64, "response.setStatus")?;
+                web::validate_header_value("status text", &text, "response.setStatus")?;
+                self.response_status = Some((code, text));
                 receiver.clone()
             }
             "getcontenttype" => header_get("Content-Type")
@@ -27802,6 +27736,7 @@ impl CfmlVirtualMachine {
                 .unwrap_or_else(|| CfmlValue::string("text/html;charset=UTF-8".to_string())),
             "setcontenttype" => {
                 let v = args.first().map(|a| a.as_string()).unwrap_or_default();
+                web::validate_header_value("Content-Type", &v, "response.setContentType")?;
                 self.response_headers
                     .retain(|(k, _)| !k.eq_ignore_ascii_case("Content-Type"));
                 self.response_headers.push(("Content-Type".to_string(), v));
@@ -27810,6 +27745,8 @@ impl CfmlVirtualMachine {
             "setheader" => {
                 let name = args.first().map(|a| a.as_string()).unwrap_or_default();
                 let val = args.get(1).map(|a| a.as_string()).unwrap_or_default();
+                web::validate_header_name(&name, "response.setHeader")?;
+                web::validate_header_value(&name, &val, "response.setHeader")?;
                 self.response_headers
                     .retain(|(k, _)| !k.eq_ignore_ascii_case(&name));
                 self.response_headers.push((name, val));
@@ -27818,6 +27755,8 @@ impl CfmlVirtualMachine {
             "addheader" => {
                 let name = args.first().map(|a| a.as_string()).unwrap_or_default();
                 let val = args.get(1).map(|a| a.as_string()).unwrap_or_default();
+                web::validate_header_name(&name, "response.addHeader")?;
+                web::validate_header_value(&name, &val, "response.addHeader")?;
                 self.response_headers.push((name, val));
                 CfmlValue::Null
             }
@@ -27861,6 +27800,7 @@ impl CfmlVirtualMachine {
             "setlocale" | "setcharacterencoding" => receiver.clone(),
             "sendredirect" => {
                 let url = args.first().map(|a| a.as_string()).unwrap_or_default();
+                web::validate_redirect_url(&url, "response.sendRedirect")?;
                 self.response_headers.push(("Location".to_string(), url));
                 self.response_status = Some((302, "Found".to_string()));
                 CfmlValue::Null
@@ -35191,6 +35131,7 @@ impl CfmlVirtualMachine {
                 auth_roles: Vec::new(),
                 timeout_secs: self.session_timeout_secs,
                 app_name: app.clone(),
+                live: None,
             });
         }
         self.session_record_created = true;
@@ -35298,6 +35239,23 @@ impl CfmlVirtualMachine {
         // session-scoped singletons never cached.
         let record = self.session_record();
         let builtins = record.as_ref().map(|r| self.session_builtin_keys(r));
+        // The in-process store hands out ONE live struct per session; every
+        // concurrent request attaches the same handle (see `SessionData::live`).
+        // A serialising store never has one — and a store that CLAIMS to
+        // serialise is held to the copy-in model regardless, so its persist-time
+        // data-only gate always runs.
+        let live = if self.session_store_serializes() {
+            None
+        } else {
+            record.as_ref().and_then(|r| r.live.clone())
+        };
+        if let Some(h) = live {
+            for (k, v) in builtins.into_iter().flatten() {
+                h.insert(k, v);
+            }
+            self.session_scope = Some(h);
+            return;
+        }
         let mut vars = record.map(|s| s.variables).unwrap_or_default();
         for (k, v) in builtins.into_iter().flatten() {
             vars.insert(k, v);
@@ -35343,6 +35301,33 @@ impl CfmlVirtualMachine {
     }
 
     fn sync_session_scope_to_store(&mut self) -> Result<(), CfmlError> {
+        if self.session_scope.is_none() {
+            return Ok(());
+        }
+        // A live (shared) record has nothing to write back — every write this
+        // request made already landed in the one struct all requests hold.
+        // Only the access time needs refreshing. The one exception: the scope
+        // was attached BEFORE the record existed (the request that creates the
+        // session, or a lazy session's first write), so this request wrote into
+        // a private struct and the record was promoted underneath it; fold those
+        // writes into the shared struct rather than drop them.
+        if let Some(mut rec) = self
+            .session_record()
+            .filter(|r| r.live.is_some() && !self.session_store_serializes())
+        {
+            let live = rec.live.clone().unwrap();
+            if let Some(ss) = self.session_scope.clone().filter(|ss| !ss.ptr_eq(&live)) {
+                for (k, v) in ss.snapshot() {
+                    if !Self::SESSION_BUILTIN_KEYS.iter().any(|b| k.eq_ignore_ascii_case(b)) {
+                        live.insert(k, v);
+                    }
+                }
+                self.session_scope = Some(live);
+            }
+            rec.last_accessed_secs = now_epoch_secs();
+            self.store_session_record(rec);
+            return Ok(());
+        }
         let mut snap = match &self.session_scope {
             Some(ss) => ss.snapshot(),
             None => return Ok(()),
@@ -35382,8 +35367,12 @@ impl CfmlVirtualMachine {
                 auth_roles: Vec::new(),
                 timeout_secs: self.session_timeout_secs,
                 app_name: app.clone(),
+                live: None,
             });
             session.variables = snap;
+            // The map is the truth again; a live handle (a serialising store
+            // delegating to the in-process map) must not shadow it.
+            session.live = None;
             session.last_accessed_secs = now;
             self.store_session_record(session);
         }
@@ -35398,7 +35387,7 @@ impl CfmlVirtualMachine {
             return CfmlValue::Struct(ss.clone());
         }
         if let Some(session) = self.session_record() {
-            return CfmlValue::strukt(session.variables.clone());
+            return CfmlValue::strukt(session.variables_snapshot());
         }
         CfmlValue::strukt(ValueMap::default())
     }
@@ -37990,24 +37979,43 @@ impl CfmlVirtualMachine {
                         // shared between unrelated types.
                         None
                     } else {
-                        self.static_stores.insert(static_key.to_string(), h.clone());
                         if has_own || inherited {
                             self.static_ctor_types.insert(static_key.to_string());
                         }
-                        if let Some(ss) = self.server_state.as_ref() {
+                        let h = if let Some(ss) = self.server_state.as_ref() {
                             // Outlives this request: register as a persistent
                             // scope (like application/server) so the cycle
                             // collector treats values displaced from it correctly.
-                            h.mark_persistent_scope();
-                            ss.static_scopes.write().insert(
-                                static_key.to_string(),
-                                StaticScopeEntry {
-                                    generation: static_generation,
-                                    scope: h.clone(),
-                                    ctor_declared: has_own || inherited,
-                                },
-                            );
-                        }
+                            //
+                            // Two requests constructing a type for the first time
+                            // at once BOTH reach here (the read above found no
+                            // entry for either). The second insert used to replace
+                            // the first scope, so the first request kept writing
+                            // `static.X` into a scope nobody else would ever see
+                            // again. Check-and-adopt under the write lock instead:
+                            // the loser takes the winner's scope (the same block
+                            // populated both) — Lucee initialises a class's statics
+                            // once, under its class-init lock.
+                            let mut scopes = ss.static_scopes.write();
+                            match scopes.get(static_key) {
+                                Some(e) if e.generation == static_generation => e.scope.clone(),
+                                _ => {
+                                    h.mark_persistent_scope();
+                                    scopes.insert(
+                                        static_key.to_string(),
+                                        StaticScopeEntry {
+                                            generation: static_generation,
+                                            scope: h.clone(),
+                                            ctor_declared: has_own || inherited,
+                                        },
+                                    );
+                                    h
+                                }
+                            }
+                        } else {
+                            h
+                        };
+                        self.static_stores.insert(static_key.to_string(), h.clone());
                         Some(h)
                     }
                 };
@@ -44863,31 +44871,57 @@ impl CfmlVirtualMachine {
                     session.last_accessed_secs = now_epoch_secs();
                     session.timeout_secs = session_timeout;
                     self.store_session_record(session);
-                } else if self.lazy_session_creation {
-                    // Lazy: defer record creation + onSessionStart until
-                    // the first write to session scope. Keep any cookie
-                    // sid intact so a re-used cookie value sticks.
-                    self.session_lazy_pending = true;
                 } else {
-                    // Eager: create the record and fire onSessionStart now.
-                    // Mint a fresh id if the embedder didn't supply one
-                    // (e.g. a request with no CFID cookie). The embedder
-                    // reads `vm.session_id` back to emit Set-Cookie.
-                    if !has_sid {
-                        self.session_id = Some(uuid::Uuid::new_v4().to_string());
+                    // The cookie named a session this application does not
+                    // hold. If NO application on this server holds it either
+                    // (`id_issued`), it was never ours — expired, invalidated,
+                    // or planted — and it is NOT adopted: from here the request
+                    // is treated exactly as if it had carried no cookie, so
+                    // whatever id the engine mints below is its own. Adopting
+                    // the value verbatim was a session-fixation hole: plant
+                    // `CFID=x` in a victim's browser, wait for them to log in,
+                    // then read session `x` with the same cookie. The embedder
+                    // compares the final id to the one it sent, so a replaced
+                    // id gets a `Set-Cookie`.
+                    //
+                    // An id another application DOES hold is kept: a browser
+                    // carries one cookie to every app on the host, and each
+                    // app then gets its own `(app, id)` session, as on Lucee
+                    // (tests/lifecycle/test_session_app_namespace.cfm).
+                    let issued = has_sid
+                        && self
+                            .server_state
+                            .as_ref()
+                            .is_some_and(|ss| ss.sessions.id_issued(&sid));
+                    if has_sid && !issued {
+                        self.session_id = None;
+                        self.invalidate_session_record_cache();
                     }
-                    let now = now_epoch_secs();
-                    self.store_session_record(SessionData {
-                        variables: ValueMap::default(),
-                        created_secs: now,
-                        last_accessed_secs: now,
-                        auth_user: None,
-                        auth_roles: Vec::new(),
-                        timeout_secs: session_timeout,
-                        app_name: app_name.clone(),
-                    });
-                    self.session_record_created = true;
-                    let _ = self.call_lifecycle_method(&mut template, "onSessionStart", vec![]);
+                    if self.lazy_session_creation {
+                        // Lazy: defer record creation + onSessionStart until
+                        // the first write to session scope; the id is minted
+                        // there (`lazy_init_session_if_pending`). A request
+                        // that never writes ends with no id and no cookie.
+                        self.session_lazy_pending = true;
+                    } else {
+                        // Eager: create the record and fire onSessionStart now.
+                        // The embedder reads `vm.session_id` back to emit
+                        // Set-Cookie.
+                        self.session_id = Some(uuid::Uuid::new_v4().to_string());
+                        let now = now_epoch_secs();
+                        self.store_session_record(SessionData {
+                            variables: ValueMap::default(),
+                            created_secs: now,
+                            last_accessed_secs: now,
+                            auth_user: None,
+                            auth_roles: Vec::new(),
+                            timeout_secs: session_timeout,
+                            app_name: app_name.clone(),
+                            live: None,
+                        });
+                        self.session_record_created = true;
+                        let _ = self.call_lifecycle_method(&mut template, "onSessionStart", vec![]);
+                    }
                 }
             }
             // Attach the live session scope so `session` reads return a live

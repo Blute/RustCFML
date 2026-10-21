@@ -203,6 +203,29 @@ static SIGNATURES: &[(&str, &[&[&str]])] = &[
     ("fileread", &[&["filepath", "file", "path"], &["charset", "encoding", "charsetorbuffersize"]]),
     ("filereadbinary", &[&["filepath", "file", "path", "source"]]),
     (
+        "fileupload",
+        &[
+            &["destination"],
+            &["filefield", "formfield"],
+            &["accept", "mimetype"],
+            &["nameconflict", "onconflict"],
+            &["strict"],
+            &["allowedextensions"],
+            &["blockedextensions"],
+        ],
+    ),
+    (
+        "fileuploadall",
+        &[
+            &["destination"],
+            &["accept", "mimetype"],
+            &["nameconflict", "onconflict"],
+            &["strict"],
+            &["allowedextensions"],
+            &["blockedextensions"],
+        ],
+    ),
+    (
         "filewrite",
         &[
             &["filepath", "file", "path", "source"],

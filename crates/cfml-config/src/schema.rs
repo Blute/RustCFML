@@ -267,6 +267,11 @@ pub struct ServerCfg {
     pub welcome_files: Vec<String>,
     #[serde(rename = "cfmlExtensions")]
     pub cfml_extensions: Vec<String>,
+    /// How many requests may run at once through the CFML/static handler.
+    /// Over the cap a request waits briefly for a slot and is then shed with
+    /// `503` + `Retry-After: 1` rather than queued without bound. `0` =
+    /// 4 × the machine's available CPU cores. WebSocket connections and
+    /// `cfthread` bodies are not requests and are not counted.
     #[serde(rename = "maxConcurrentRequests")]
     #[serde(deserialize_with = "de_lenient_num")]
     pub max_concurrent_requests: u32,
@@ -279,10 +284,36 @@ pub struct ServerCfg {
     #[serde(rename = "maxRequestBodySize")]
     #[serde(deserialize_with = "de_lenient_num")]
     pub max_request_body_size: u64,
+    /// Parts per `multipart/form-data` body. `0` = unlimited. The body-size cap
+    /// alone lets one request carry hundreds of thousands of near-empty parts,
+    /// each of which costs a form key or an upload temp file, so the part
+    /// count is capped on its own; 1000 is far above any real form. Exceeding
+    /// this returns 413, as the body-size cap does.
+    #[serde(rename = "maxMultipartParts")]
+    #[serde(deserialize_with = "de_lenient_num")]
+    pub max_multipart_parts: u32,
     /// Seconds. `0` = no timeout.
     #[serde(rename = "requestTimeout")]
     #[serde(deserialize_with = "de_lenient_num")]
     pub request_timeout: u32,
+    /// Seconds a connection may take to deliver a complete request header
+    /// block before the server closes it. `0` = no limit. Bounds the
+    /// slowloris shape (a header line trickled in forever); a client that
+    /// has not finished its headers has nothing a `408` could be sent to, so
+    /// the connection is simply closed.
+    #[serde(rename = "headerReadTimeout")]
+    #[serde(deserialize_with = "de_lenient_num")]
+    pub header_read_timeout: u32,
+    /// Seconds a request may take to deliver its whole body, measured from
+    /// the moment the server starts reading it. `0` = no limit. Covers both
+    /// the streamed multipart path and the buffered body: a body that stops
+    /// short of its `Content-Length` is answered `408` and the connection
+    /// closed. Also the slack added to `requestTimeout` for the whole-request
+    /// deadline: a request can never outlive `requestTimeout +
+    /// bodyReadTimeout` once `requestTimeout` is set.
+    #[serde(rename = "bodyReadTimeout")]
+    #[serde(deserialize_with = "de_lenient_num")]
+    pub body_read_timeout: u32,
     #[serde(deserialize_with = "de_lenient_bool")]
     pub http2: bool,
     /// Front-controller fallback: run a configured template for URLs that
@@ -305,7 +336,10 @@ impl Default for ServerCfg {
             cfml_extensions: vec!["cfm".into(), "cfc".into()],
             max_concurrent_requests: 0,
             max_request_body_size: 200 * 1024 * 1024,
+            max_multipart_parts: 1000,
             request_timeout: 0,
+            header_read_timeout: 30,
+            body_read_timeout: 60,
             http2: false,
             fallback: FallbackCfg::default(),
         }

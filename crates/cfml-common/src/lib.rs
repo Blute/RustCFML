@@ -28,6 +28,7 @@ pub mod objcodec;
 pub mod perf_counters;
 pub mod position;
 pub mod session_cookie;
+pub mod stack_guard;
 pub mod text;
 pub mod vfs;
 pub mod vm;

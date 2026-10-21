@@ -1872,7 +1872,10 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
             )
         }
         "cfsavecontent" => {
-            let variable = attrs.get("variable").cloned().unwrap_or("__savecontent_result".to_string());
+            // No `variable=`: capture into a frame-local temp (`var`), not an
+            // unscoped name that lands in a shared component's `variables`
+            // (GH #493 audit).
+            let variable = attrs.get("variable").cloned().unwrap_or("var __savecontent_result".to_string());
             // Find closing tag — body between is processed by main loop
             if let Some(end_tag_pos) = find_closing_tag(chars, tag_end, len, "cfsavecontent") {
                 let body: String = chars[tag_end..end_tag_pos].iter().collect();
@@ -2476,7 +2479,8 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
                     opts.push(format!("body: \"{}\"", body_trimmed.replace('"', "\"\"")));
                 }
                 if let Some(ref var) = variable {
-                    let mut result = format!("__cfexec_tmp = __cfexecute({{ {} }});\n", opts.join(", "));
+                    // `var`: frame-local, never the shared `variables` scope (GH #493 audit).
+                    let mut result = format!("var __cfexec_tmp = __cfexecute({{ {} }});\n", opts.join(", "));
                     result.push_str(&format!("{} = __cfexec_tmp.output;\n", var));
                     if let Some(ref ev) = error_variable {
                         result.push_str(&format!("{} = __cfexec_tmp.error;\n", ev));
@@ -2488,7 +2492,7 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
             } else {
                 // Self-closing
                 if let Some(ref var) = variable {
-                    let mut result = format!("__cfexec_tmp = __cfexecute({{ {} }});\n", opts.join(", "));
+                    let mut result = format!("var __cfexec_tmp = __cfexecute({{ {} }});\n", opts.join(", "));
                     result.push_str(&format!("{} = __cfexec_tmp.output;\n", var));
                     if let Some(ref ev) = error_variable {
                         result.push_str(&format!("{} = __cfexec_tmp.error;\n", ev));
@@ -2523,7 +2527,9 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
                     opts.push("parts: __cfmail_parts".to_string());
                     opts.push("body: __cfmail_body".to_string());
                     let code = format!(
-                        "__cfmail_params = [];\n__cfmail_parts = [];\n__cfsavecontent_start();\n{}__cfmail_body = __cfsavecontent_end();\n__cfmail({{ {} }});\n",
+                        // `var`: the accumulators and the captured body are
+                        // frame-local, not shared `variables` (GH #493 audit).
+                        "var __cfmail_params = [];\nvar __cfmail_parts = [];\n__cfsavecontent_start();\n{}var __cfmail_body = __cfsavecontent_end();\n__cfmail({{ {} }});\n",
                         body_script, opts.join(", ")
                     );
                     return (code, close_end - start);
@@ -2619,7 +2625,7 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
                     // Placeholders are constructed from the runtime list length
                     // — repeatString is a builtin in stdlib.
                     let code = format!(
-                        "__cfproc_params = [];\n{}__cfproc_placeholders = arrayLen(__cfproc_params) == 0 ? \"\" : reReplace(repeatString(\"?,\", arrayLen(__cfproc_params)), \",$\", \"\", \"one\");\n{} = queryExecute(\"CALL {}(\" & __cfproc_placeholders & \")\", __cfproc_params{});\n",
+                        "var __cfproc_params = [];\n{}var __cfproc_placeholders = arrayLen(__cfproc_params) == 0 ? \"\" : reReplace(repeatString(\"?,\", arrayLen(__cfproc_params)), \",$\", \"\", \"one\");\n{} = queryExecute(\"CALL {}(\" & __cfproc_placeholders & \")\", __cfproc_params{});\n",
                         body_script, result_var, procedure, opts_str
                     );
                     return (code, close_end - start);
@@ -4329,14 +4335,23 @@ fn parse_cffile_tag(
         "delete" => {
             (format!("fileDelete({});\n", attr_expr("file")), consumed)
         }
+        // The whole attribute set rides as one struct — `action` included, so
+        // the VM can tell upload from uploadAll — and the result struct lands
+        // in `cffile`, or in the variable `result` names, as on Lucee. The
+        // attribute used to be dropped and the return value discarded, so a
+        // tag-form upload could not report what it saved.
         "upload" | "uploadall" => {
-            let func = if action == "uploadall" { "__cffile_upload" } else { "__cffile_upload" };
             let mut parts = Vec::new();
             for (k, v) in attrs {
-                if k == "action" { continue; }
+                if k == "result" { continue; }
                 parts.push(format!("{}: {}", k, format_attr_value(v, quoted.contains(k.as_str()))));
             }
-            (format!("{}({{ {} }});\n", func, parts.join(", ")), consumed)
+            let target = attrs
+                .get("result")
+                .map(|r| strip_hashes(r).trim().to_string())
+                .filter(|r| !r.is_empty())
+                .unwrap_or_else(|| "cffile".to_string());
+            (format!("{} = __cffile_upload({{ {} }});\n", target, parts.join(", ")), consumed)
         }
         _ => {
             (format!("throw(\"cffile action='{}' is not implemented.\");\n", action), consumed)

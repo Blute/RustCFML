@@ -49,6 +49,15 @@ log = { workspace = true }
 env_logger = "0.11"
 clap = { version = "4.0", features = ["derive"] }
 axum = { version = "0.8", features = ["ws"] }
+# The accept loop is ours, not `axum::serve`'s: axum builds the hyper
+# connection without a timer, which silently disables hyper's header-read
+# timeout and leaves a trickled header block pinning a connection forever.
+# Already in the graph through axum (same version, same crate); this only adds
+# the `server-auto` feature so the builder is nameable here.
+hyper-util = { version = "0.1", features = ["tokio", "server", "server-auto", "service", "http1"] }
+# `ServiceExt::map_request`, to stamp the peer address on each request in
+# that loop. Already in the graph through axum with this feature on.
+tower = { version = "0.5", features = ["util"] }
 # Only for `LengthLimitError`: lets a body-read failure be classified as a real
 # over-limit (413) rather than lumping every transport error in with it.
 http-body-util = "0.1"

@@ -109,7 +109,30 @@ const PAGE: &str = r#"<cfscript> session.visits = ( session.visits ?: 0 ) + 1; <
 
 /// Run one request against a caller-supplied store + session id, so a test
 /// can fire several requests at the *same* session and inspect persistence.
+/// The id is made KNOWN to the store first: an id the store has never issued
+/// is not adopted (session fixation), and these tests are about persisting an
+/// established session, not minting one.
 fn run_request(store: Arc<dyn SessionStore>, sid: &str) {
+    if !store.contains(APP_NAME, sid) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        store.set(
+            APP_NAME,
+            sid,
+            SessionData {
+                variables: ValueMap::default(),
+                created_secs: now,
+                last_accessed_secs: now,
+                auth_user: None,
+                auth_roles: Vec::new(),
+                timeout_secs: 3600,
+                app_name: APP_NAME.to_string(),
+                live: None,
+            },
+        );
+    }
     let mut files: HashMap<String, Vec<u8>> = HashMap::new();
     files.insert("Application.cfc".to_string(), APP.as_bytes().to_vec());
     files.insert("index.cfm".to_string(), PAGE.as_bytes().to_vec());
@@ -155,7 +178,7 @@ fn run_request(store: Arc<dyn SessionStore>, sid: &str) {
 }
 
 fn visits(data: &SessionData) -> i64 {
-    data.variables
+    data.variables_snapshot()
         .iter()
         .find(|(k, _)| k.eq_ignore_ascii_case("visits"))
         .and_then(|(_, v)| v.as_string().trim().parse::<i64>().ok())

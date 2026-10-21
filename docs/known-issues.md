@@ -151,7 +151,6 @@ These deserialize without error but have no runtime effect:
 
 | Key | Notes |
 |---|---|
-| `server.maxConcurrentRequests` | No concurrency limiting. |
 | `server.http2` | Not wired to the HTTP server. |
 | `runtime.trustedCache` | Reserved; bytecode-cache trust is driven by `--production`, not this key. |
 | `debugging.showExecutionTime` | No timing output. |
@@ -4341,3 +4340,63 @@ maximum (MySQL 100; SQLite, PostgreSQL, SQL Server 10).
 Real counts need the pool to expose them (a patched or replaced MySQL pool).
 `getDatasource()` also accepts an application's datasources, where Lucee's sees only
 configured ones — the two are not distinguishable once registered.
+
+## 117. `cfthread` inside a CFC: a thread's write to `variables` is not visible after `join` 🌟
+
+The thread body runs against a **snapshot** of the component's `variables` scope
+(GH #234/#366: isolation, so a thread cannot observe a half-written instance).
+`this.x = …` from the thread hits the live instance and so does `application.o.x`,
+but `variables.x = …` lands in the thread's copy and is gone once it ends. On
+Lucee the thread runs inside the component and the write is visible to the
+instance after `thread action="join"`. Kept deliberately (2026-10-21 audit): write
+results into `this`, a local struct you join on, or `application`, not into the
+instance's `variables`.
+
+## 118. Session scope: in-process sessions are one live struct; external stores are copy-in / whole-blob 🏗
+
+With the default in-memory store every request of a session attaches the **same**
+live struct, as on Lucee: two concurrent requests in one session both keep their
+writes (before 2026-10-21 each request copied the map in and wrote the whole map
+back at the end, so a slow request's `session.a = …` silently discarded a fast
+one's `session.b = …`). The serialising stores — datasource, memcached, cluster —
+cannot hold a live reference, so they stay on the documented last-write-wins
+whole-blob model, which is also how Lucee's external session storage behaves.
+
+## 119. Input limits that Lucee does not have: JSON 512 / XML 1024 deep, header values validated, `fileUpload` defaults 🏗
+
+Added in the 2026-10-21 hardening pass; each one turns a process abort or a worker
+panic into a CFML error.
+
+- `deserializeJSON` / `isJSON`: more than **512** nested arrays/objects →
+  "JSON nesting too deep". `xmlParse` / `isXML`: more than **1024** nested elements →
+  "XML nesting too deep". `serializeJSON`, `duplicate()` and `writeDump` of a value
+  built that deep in CFML stop with "nesting too deep" (dump truncates with a marker).
+  Before, each overflowed the native stack and **aborted the whole server** — a stack
+  overflow is not a catchable panic. Lucee has no fixed depth limit.
+- A UDF call that would exhaust the native stack throws "Call stack overflow" instead
+  of aborting (debug builds reach ~180 frames; release keeps the existing depth-256
+  same-function detector, which still refuses a legitimately deep recursion Lucee
+  allows — pre-existing).
+- `cfheader` / `cfcookie` / `cflocation` / `cfcontent` / `getPageContext().getResponse()`:
+  a status code outside 100–599, a header name that is not an RFC 7230 token, or a
+  value/cookie attribute containing CR, LF, NUL or another control character **throws**
+  (type `application`). Lucee does no validation of its own and leaves it to the
+  servlet container; RustCFML's server used to panic the worker on the same input.
+- `fileUpload` / `fileUploadAll` / `<cffile action="upload">`: `accept` is now enforced
+  (MIME patterns, `image/*`, or extension entries) with `strict=true` by default as on
+  Lucee, the default extension block list is Lucee's (`asp,aspx,cfc,cfm,cfml,do,htm,
+  html,jsp,jspx,php` — override with `allowedExtensions`/`blockedExtensions` or
+  `this.blockedExtForFileUpload`), and `nameConflict` defaults to `error` as on Lucee
+  (it used to overwrite silently). A `.cfm` declared as `image/png` was previously
+  saved and then executed.
+- `cfzip action="unzip"`: an entry whose name is absolute or climbs out of the
+  destination (`../x`) refuses the whole archive, as Lucee does.
+- Server limits (`server.headerReadTimeout` 30 s, `server.bodyReadTimeout` 60 s,
+  `server.maxConcurrentRequests` 4 × cores, `server.maxMultipartParts` 1000, filename
+  ≤ 255 chars) are in [configuration.md](configuration.md#overload-protection). A
+  client-supplied `CFID` that **no application on this server holds** is not adopted
+  — a fresh id is minted, unlike CF/Lucee, which honour the planted value (session
+  fixation). An id another application holds is kept, so one browser cookie serves
+  every app on a host, each with its own `(app, id)` session. The memcached and
+  cluster stores cannot answer "does any app hold this id" and keep CF/Lucee's
+  behaviour.

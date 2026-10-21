@@ -827,7 +827,14 @@ pub fn run() {
     // doesn't blow the default ~8 MB main-thread stack (especially in debug builds).
     const STACK_SIZE: usize = 64 * 1024 * 1024;
     let builder = std::thread::Builder::new().stack_size(STACK_SIZE);
-    let handler = builder.spawn(real_main).expect("failed to spawn main thread");
+    let handler = builder
+        .spawn(|| {
+            // Let the VM turn a would-be native stack overflow (an abort)
+            // into a catchable CFML error.
+            cfml_common::stack_guard::init(STACK_SIZE);
+            real_main()
+        })
+        .expect("failed to spawn main thread");
     if let Err(e) = handler.join() {
         eprintln!("Fatal: {:?}", e);
         exit(1);
@@ -1423,6 +1430,7 @@ fn spawn_cfthread(seed: ThreadSeed) -> ThreadHandle {
     let join = std::thread::Builder::new()
         .stack_size(CFTHREAD_STACK_SIZE)
         .spawn(move || {
+            cfml_common::stack_guard::init(CFTHREAD_STACK_SIZE);
             // The allocation log is THREAD-LOCAL, armed per thread by `enable()`,
             // and until now only the request path ever called it. So every
             // struct, array, scope or component instance allocated on a cfthread
@@ -2010,6 +2018,31 @@ struct AppState {
     /// at startup; dev mode currently also reads once (live-reload lands in a
     /// later phase). Used for HTTP-block list and downstream wiring.
     cfconfig: Arc<RustCfmlConfig>,
+    /// `server.maxConcurrentRequests`: one permit per request inside
+    /// `handle_request`. WebSocket connections take their own route and
+    /// `cfthread` bodies run on plain OS threads, so neither holds one.
+    request_gate: Arc<tokio::sync::Semaphore>,
+}
+
+/// How long an over-cap request waits for a `request_gate` permit before it
+/// is shed with 503. Short on purpose: a slot that does not free up within
+/// this window means the server is genuinely saturated, and holding the
+/// client (and its connection) any longer only deepens the queue.
+const REQUEST_GATE_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Resolve `server.maxConcurrentRequests` to a permit count: the configured
+/// value, or 4 × the available CPU cores when it is 0/unset. The CFML side of
+/// a request runs on the blocking pool, so the cap is what keeps a flood of
+/// slow pages from piling blocking threads (and their 64 MB stacks) without
+/// bound.
+fn request_gate_permits(configured: u32) -> usize {
+    if configured > 0 {
+        return configured as usize;
+    }
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .saturating_mul(4)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2072,12 +2105,20 @@ fn run_server(
     let rt = if single_threaded {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
+            // `spawn_blocking` still runs requests on pool threads here; give
+            // them the same stack (and guard) as the multi-threaded runtime.
+            .thread_stack_size(64 * 1024 * 1024)
+            .on_thread_start(|| cfml_common::stack_guard::init(64 * 1024 * 1024))
             .build()
             .unwrap()
     } else {
         tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .thread_stack_size(64 * 1024 * 1024) // 64MB — parity with the CLI main thread for deep ColdBox/WireBox autowiring
+            // Requests run on the blocking pool (`spawn_blocking`); arm the
+            // native-stack guard on each of its threads so runaway recursion
+            // is a CFML error on that request, not an abort of the server.
+            .on_thread_start(|| cfml_common::stack_guard::init(64 * 1024 * 1024))
             .build()
             .unwrap()
     };
@@ -2863,6 +2904,17 @@ async fn async_run_server(
         let h = cfconfig.server.host.trim();
         if h.is_empty() { "0.0.0.0".to_string() } else { h.to_string() }
     };
+    // `server.headerReadTimeout` for the accept loop; `0` = none.
+    let header_read_timeout = match cfconfig.server.header_read_timeout {
+        0 => None,
+        secs => Some(std::time::Duration::from_secs(u64::from(secs))),
+    };
+    let request_permits = request_gate_permits(cfconfig.server.max_concurrent_requests);
+    log::info!(
+        "server.maxConcurrentRequests = {} ({})",
+        request_permits,
+        if cfconfig.server.max_concurrent_requests == 0 { "4 x available cores" } else { "configured" }
+    );
 
     let app_state = Arc::new(AppState {
         doc_root: doc_root.to_path_buf(),
@@ -2875,6 +2927,7 @@ async fn async_run_server(
         resolved_file_cache: Arc::new(RwLock::new(HashMap::new())),
         fallback_resolved_cache: Arc::new(RwLock::new(None)),
         cfconfig,
+        request_gate: Arc::new(tokio::sync::Semaphore::new(request_permits)),
     });
 
     // socket.io transport (Phase 3): a tower layer that owns `/socket.io/` and
@@ -2942,27 +2995,22 @@ async fn async_run_server(
                     mode,
                     &banner_root,
                 );
-                // Unix-socket peers have no IP address, so the
-                // ConnectInfo<SocketAddr> extractor in `handle_request` would
-                // fail at runtime under `into_make_service()`. Inject a synthetic
-                // loopback ConnectInfo extension on every request so the shared
-                // handler works unchanged.
-                let app = app.layer(axum::middleware::map_request(
-                    |mut req: axum::extract::Request| async move {
-                        req.extensions_mut().insert(axum::extract::ConnectInfo(
-                            std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
-                        ));
-                        req
-                    },
-                ));
                 // Graceful shutdown on SIGINT/SIGTERM: stop accepting, let
                 // in-flight requests finish, then remove the socket file so the
-                // next start binds cleanly.
+                // next start binds cleanly. Unix-socket peers have no IP
+                // address, so the ConnectInfo<SocketAddr> extractor in
+                // `handle_request` would fail at runtime; the accept loop
+                // stamps a synthetic loopback peer on every request instead so
+                // the shared handler works unchanged.
                 let cleanup_path = sock_path.clone();
-                axum::serve(listener, app.into_make_service())
-                    .with_graceful_shutdown(shutdown_signal())
-                    .await
-                    .unwrap();
+                serve_with_header_timeout(
+                    listener,
+                    app,
+                    header_read_timeout,
+                    |_| std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
+                    shutdown_signal(),
+                )
+                .await;
                 cfml_vm::upload_temp::remove_outstanding_upload_temp_files();
                 #[cfg(all(feature = "obs-otel", not(target_arch = "wasm32")))]
                 otel::shutdown();
@@ -2996,8 +3044,8 @@ async fn async_run_server(
             print_ready_banner(&format!("running on http://{bound}"), mode, &banner_root);
             // Disable Nagle's algorithm on accepted connections. For a request/response
             // HTTP server, Nagle adds latency by holding small writes, and can stall on
-            // the classic Nagle + delayed-ACK interaction. axum::serve does not set this
-            // by default, so opt in via tap_io. (Go net/http, nginx, Node all default on.)
+            // the classic Nagle + delayed-ACK interaction. The accept loop does not set
+            // this by default, so opt in via tap_io. (Go net/http, nginx, Node all default on.)
             use axum::serve::ListenerExt;
             let listener = listener.tap_io(|tcp_stream| {
                 let _ = tcp_stream.set_nodelay(true);
@@ -3008,10 +3056,7 @@ async fn async_run_server(
             // being killed mid-flight by the signal — and it is what makes
             // `docker stop` / `kubectl delete pod` exit promptly and cleanly
             // instead of waiting out the grace period (see `shutdown_signal`).
-            axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>())
-                .with_graceful_shutdown(shutdown_signal())
-                .await
-                .unwrap();
+            serve_with_header_timeout(listener, app, header_read_timeout, |a| *a, shutdown_signal()).await;
             // Nothing can be reading this process's upload temp files once it
             // is gone (GH #386).
             cfml_vm::upload_temp::remove_outstanding_upload_temp_files();
@@ -3019,6 +3064,100 @@ async fn async_run_server(
             otel::shutdown();
         }
     }
+}
+
+/// The accept loop. `axum::serve` would do, except that it builds each hyper
+/// connection WITHOUT a timer, and hyper disables its header-read timeout
+/// (nominally 30 s) when it has no timer to run it on. So a client that sent
+/// `GET / HTTP/1.1\r\nX-Slow: ` and then nothing held its connection — and
+/// the server's accept slot, socket and buffers — for as long as it cared
+/// to, and a few thousand of them is a slowloris that needs no bandwidth at
+/// all. The builder is ours here so it carries a `TokioTimer` and
+/// `server.headerReadTimeout`; a connection whose header block does not
+/// finish in time is closed (there is no request yet to answer with 408).
+///
+/// Everything else mirrors `axum::serve`: HTTP/1 with upgrades (WebSocket)
+/// and HTTP/2 auto-detected on the same port, the peer address stamped on
+/// each request as `ConnectInfo<SocketAddr>` (`remote_addr` maps the
+/// listener's address type — a Unix socket has none, so it supplies a
+/// loopback stand-in), and graceful shutdown: `signal` stops the accept
+/// loop, every live connection is told to finish its in-flight request, and
+/// the future resolves once the last one has gone.
+async fn serve_with_header_timeout<L, F>(
+    mut listener: L,
+    app: axum::Router,
+    header_read_timeout: Option<std::time::Duration>,
+    remote_addr: fn(&L::Addr) -> std::net::SocketAddr,
+    signal: F,
+) where
+    L: axum::serve::Listener,
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    use futures_util::FutureExt;
+    use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
+    use hyper_util::server::conn::auto::Builder;
+    use hyper_util::service::TowerToHyperService;
+    use tokio::sync::watch;
+    use tower::ServiceExt;
+
+    // `signal_rx` is dropped when the signal fires; `signal_tx.closed()` is
+    // how the accept loop and every connection task learn of it.
+    let (signal_tx, signal_rx) = watch::channel(());
+    tokio::spawn(async move {
+        signal.await;
+        drop(signal_rx);
+    });
+    // Each connection task holds a `close_rx` clone; `close_tx.closed()`
+    // resolves once the last of them has finished.
+    let (close_tx, close_rx) = watch::channel(());
+
+    loop {
+        let (io, addr) = tokio::select! {
+            conn = listener.accept() => conn,
+            _ = signal_tx.closed() => break,
+        };
+        let peer = remote_addr(&addr);
+        let service = app.clone().map_request(move |mut req: axum::http::Request<_>| {
+            req.extensions_mut().insert(axum::extract::ConnectInfo(peer));
+            req
+        });
+        let hyper_service = TowerToHyperService::new(service);
+        let signal_tx = signal_tx.clone();
+        let close_rx = close_rx.clone();
+
+        tokio::spawn(async move {
+            let mut builder = Builder::new(TokioExecutor::new());
+            builder
+                .http1()
+                .timer(TokioTimer::new())
+                .header_read_timeout(header_read_timeout);
+            let mut conn = std::pin::pin!(
+                builder.serve_connection_with_upgrades(TokioIo::new(io), hyper_service)
+            );
+            let mut signal_closed = std::pin::pin!(signal_tx.closed().fuse());
+            loop {
+                tokio::select! {
+                    result = conn.as_mut() => {
+                        if let Err(e) = result {
+                            // Includes the header-read timeout firing and the
+                            // peer hanging up mid-request: routine, not an error.
+                            log::trace!("connection from {peer} ended: {e:#}");
+                        }
+                        break;
+                    }
+                    _ = &mut signal_closed => {
+                        conn.as_mut().graceful_shutdown();
+                    }
+                }
+            }
+            drop(close_rx);
+        });
+    }
+
+    drop(close_rx);
+    drop(listener);
+    log::debug!("shutdown: waiting for {} connection(s) to finish", close_tx.receiver_count());
+    close_tx.closed().await;
 }
 
 /// Await the first shutdown signal: `SIGINT` (Ctrl+C) or, on unix, `SIGTERM`.
@@ -3132,12 +3271,99 @@ async fn handle_request(
     addr: axum::extract::ConnectInfo<std::net::SocketAddr>,
     req: axum::extract::Request,
 ) -> axum::response::Response {
-    let (mut response, rewrite_status) = REWRITE_STATUS
-        .scope(std::cell::Cell::new(None), async {
-            let r = handle_request_inner(state, addr, req).await;
-            (r, REWRITE_STATUS.with(|c| c.get()))
+    // Admission, in this order, before anything is read off the body:
+    //
+    // 1. `--max-memory` back-pressure. Over the soft limit the answer is 503
+    //    whatever the gate says, so it is decided first — a request the
+    //    enforcer is going to shed must not sit in the permit queue for up
+    //    to `REQUEST_GATE_WAIT` only to be refused on the other side.
+    // 2. `server.maxConcurrentRequests`. The permit lives in `_permit` for
+    //    the rest of the handler, so it is released when the response is
+    //    built — not when the body has drained — and a request that waited
+    //    the whole window without one is shed with `Retry-After: 1`. The
+    //    two are never both charged: a memory-shed request never takes a
+    //    permit, and a gate-shed one never reaches the enforcer.
+    if let Some(fp) = memory_limit::enforcer().and_then(|e| e.check_admission()) {
+        let limit = memory_limit::enforcer().map(|e| e.limit().max).unwrap_or(0);
+        return axum::response::Response::builder()
+            .status(503)
+            .header("Retry-After", memory_limit::RETRY_AFTER_SECS.to_string())
+            .header("Content-Type", "text/plain; charset=utf-8")
+            .body(axum::body::Body::from(format!(
+                "503 Service Unavailable: process memory {} is over the configured limit {} (--max-memory); shedding, retry shortly\n",
+                memory_limit::human(fp),
+                memory_limit::human(limit)
+            )))
+            .unwrap();
+    }
+    let gate = state.request_gate.clone();
+    let _permit = match tokio::time::timeout(REQUEST_GATE_WAIT, gate.acquire_owned()).await {
+        Ok(Ok(permit)) => permit,
+        // Closed never happens (the semaphore lives in AppState); treat it
+        // like saturation rather than let a request through ungated.
+        Ok(Err(_)) | Err(_) => {
+            log::warn!(
+                "503 {} {}: server.maxConcurrentRequests ({}) reached; no slot freed within {:?}",
+                req.method(),
+                req.uri().path(),
+                state.cfconfig.server.max_concurrent_requests,
+                REQUEST_GATE_WAIT
+            );
+            return axum::response::Response::builder()
+                .status(503)
+                .header("Retry-After", "1")
+                .header("Content-Type", "text/plain; charset=utf-8")
+                .body(axum::body::Body::from(
+                    "503 Service Unavailable: too many concurrent requests (server.maxConcurrentRequests); retry shortly\n",
+                ))
+                .unwrap();
+        }
+    };
+
+    // Whole-request deadline. `server.requestTimeout` bounds the VM from
+    // inside (Lucee-faithfully, at blocking points), but a request also
+    // spends time outside the VM: reading its body, and in the error page
+    // after the VM stops. Capping the handler at `requestTimeout +
+    // bodyReadTimeout` means nothing with `requestTimeout` set can outlive
+    // both — a request past this point is answered 503 and the VM's own
+    // clock finishes the blocking thread. `0` keeps the VM's clock the only
+    // bound, as before.
+    let deadline = {
+        let s = &state.cfconfig.server;
+        (s.request_timeout > 0).then(|| {
+            std::time::Duration::from_secs(u64::from(s.request_timeout) + u64::from(s.body_read_timeout))
         })
-        .await;
+    };
+    let method = req.method().clone();
+    let path = req.uri().path().to_string();
+    let scoped = REWRITE_STATUS.scope(std::cell::Cell::new(None), async {
+        let r = handle_request_inner(state, addr, req).await;
+        (r, REWRITE_STATUS.with(|c| c.get()))
+    });
+    let (mut response, rewrite_status) = match deadline {
+        None => scoped.await,
+        Some(limit) => match tokio::time::timeout(limit, scoped).await {
+            Ok(done) => done,
+            Err(_) => {
+                log::error!(
+                    "503 {method} {path}: request exceeded server.requestTimeout + server.bodyReadTimeout ({}s) and was abandoned",
+                    limit.as_secs()
+                );
+                (
+                    axum::response::Response::builder()
+                        .status(503)
+                        .header("Content-Type", "text/plain; charset=utf-8")
+                        .header("Connection", "close")
+                        .body(axum::body::Body::from(format!(
+                            "503 Service Unavailable: request exceeded the server deadline of {}s (server.requestTimeout + server.bodyReadTimeout)\n",
+                            limit.as_secs()
+                        )))
+                        .unwrap(),
+                    None,
+                )
+            }
+        },
+    };
     // Like tuckey, the rule sets the status before the forwarded page runs, so
     // a page that sets its own status (cfheader) keeps it: only a plain 200 is
     // replaced.
@@ -3208,20 +3434,88 @@ fn body_read_error_is_length_limit(err: &axum::Error) -> bool {
     false
 }
 
+/// The `408` for a body that did not finish arriving within
+/// `server.bodyReadTimeout`. `Connection: close` because the unread remainder
+/// of the body is still on the wire: hyper would otherwise try to drain it
+/// before the next request, which is the very wait this timeout exists to end.
+fn body_read_timeout_response(
+    method: &str,
+    url: &str,
+    headers: &axum::http::HeaderMap,
+    timeout_secs: u32,
+) -> axum::response::Response {
+    let declared = headers
+        .get(axum::http::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("unknown");
+    log::warn!(
+        "408 {method} {url}: request body not fully received within server.bodyReadTimeout \
+         ({timeout_secs}s); declared content-length {declared}"
+    );
+    axum::response::Response::builder()
+        .status(408)
+        .header("Content-Type", "text/plain; charset=utf-8")
+        .header("Connection", "close")
+        .body(axum::body::Body::from(format!(
+            "408 Request Timeout: the request body was not received within {timeout_secs}s \
+             (server.bodyReadTimeout in cfconfig; 0 = no limit).\n"
+        )))
+        .unwrap()
+}
+
+/// Longest `filename=` a part may carry. Every filesystem we save to caps a
+/// name at 255 bytes, and a client sending more is not a browser.
+const MAX_UPLOAD_FILENAME_CHARS: usize = 255;
+
+/// Why a multipart body was not parsed: multer's own errors (the size caps,
+/// malformed framing, a transport failure), or one of the two limits multer
+/// does not enforce itself.
+enum MultipartRejection {
+    Multer(multer::Error),
+    /// More parts than `server.maxMultipartParts`.
+    TooManyParts { max: u32 },
+    /// A `filename=` over [`MAX_UPLOAD_FILENAME_CHARS`].
+    FilenameTooLong { len: usize },
+}
+
+impl From<multer::Error> for MultipartRejection {
+    fn from(e: multer::Error) -> Self {
+        MultipartRejection::Multer(e)
+    }
+}
+
+impl std::fmt::Display for MultipartRejection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MultipartRejection::Multer(e) => write!(f, "{e}"),
+            MultipartRejection::TooManyParts { max } => {
+                write!(f, "more than {max} parts in the multipart body")
+            }
+            MultipartRejection::FilenameTooLong { len } => write!(
+                f,
+                "a part's filename is {len} characters long (limit {MAX_UPLOAD_FILENAME_CHARS})"
+            ),
+        }
+    }
+}
+
 /// Parse a `multipart/form-data` body straight off the wire, writing each file
 /// part to its own temp file as the bytes arrive.
 ///
 /// Peak memory is one copy buffer plus the non-file form fields, whatever the
 /// upload size — the body is never assembled. `limit` is
-/// `server.maxRequestBodySize` applied to the whole stream, so an over-limit
-/// upload still fails with the same 413 it did when the body was buffered, but
-/// without allocating the limit first.
+/// `server.maxRequestBodySize` applied to the whole stream (and to each part),
+/// so an over-limit upload still fails with the same 413 it did when the body
+/// was buffered, but without allocating the limit first. `max_parts` is
+/// `server.maxMultipartParts` (`0` = unlimited): the size cap on its own left
+/// the part count unbounded, and every part costs a form key or a temp file.
 async fn stream_multipart_form(
     body: axum::body::Body,
     content_type: &str,
     limit: usize,
+    max_parts: u32,
     uploads: &mut cfml_vm::upload_temp::UploadTempFiles,
-) -> Result<cfml_common::dynamic::ValueMap, multer::Error> {
+) -> Result<cfml_common::dynamic::ValueMap, MultipartRejection> {
     use cfml_common::dynamic::{CfmlValue, ValueMap};
     use tokio::io::AsyncWriteExt;
 
@@ -3229,14 +3523,22 @@ async fn stream_multipart_form(
     let constraints = if limit == usize::MAX {
         multer::Constraints::new()
     } else {
-        multer::Constraints::new()
-            .size_limit(multer::SizeLimit::new().whole_stream(limit as u64))
+        multer::Constraints::new().size_limit(
+            multer::SizeLimit::new()
+                .whole_stream(limit as u64)
+                .per_field(limit as u64),
+        )
     };
     let mut multipart =
         multer::Multipart::with_constraints(body.into_data_stream(), boundary, constraints);
 
     let mut form = ValueMap::default();
+    let mut parts: u32 = 0;
     while let Some(mut field) = multipart.next_field().await? {
+        parts += 1;
+        if max_parts != 0 && parts > max_parts {
+            return Err(MultipartRejection::TooManyParts { max: max_parts });
+        }
         let field_name = match field.name() {
             Some(n) => n.to_string(),
             None => continue,
@@ -3245,6 +3547,12 @@ async fn stream_multipart_form(
             continue;
         }
         let file_name = field.file_name().map(|f| f.to_string());
+        if let Some(raw) = &file_name {
+            let len = raw.chars().count();
+            if len > MAX_UPLOAD_FILENAME_CHARS {
+                return Err(MultipartRejection::FilenameTooLong { len });
+            }
+        }
         let part_content_type = field.content_type().map(|m| m.to_string());
 
         match file_name {
@@ -3392,12 +3700,48 @@ fn process_is_alive(_pid: u32) -> bool {
 /// The distinction matters as much here as it did for `to_bytes`: a client that
 /// aborted mid-upload must not be told it exceeded a limit it never approached.
 fn multipart_error_response(
-    err: multer::Error,
+    err: MultipartRejection,
     method: &str,
     url: &str,
     declared: &str,
     configured_limit: u64,
 ) -> axum::response::Response {
+    let plain = |status: u16, body: String| {
+        axum::response::Response::builder()
+            .status(status)
+            .header("Content-Type", "text/plain; charset=utf-8")
+            .body(axum::body::Body::from(body))
+            .unwrap()
+    };
+    let err = match err {
+        MultipartRejection::TooManyParts { max } => {
+            log::error!(
+                "413 {method} {url}: multipart body exceeds server.maxMultipartParts ({max}); \
+                 declared content-length {declared}"
+            );
+            return plain(
+                413,
+                format!(
+                    "Too many parts in the request body. The server limit is {max} parts \
+                     (server.maxMultipartParts in cfconfig; 0 = unlimited)."
+                ),
+            );
+        }
+        MultipartRejection::FilenameTooLong { len } => {
+            log::error!(
+                "400 {method} {url}: a multipart part carries a {len}-character filename \
+                 (limit {MAX_UPLOAD_FILENAME_CHARS}); declared content-length {declared}"
+            );
+            return plain(
+                400,
+                format!(
+                    "Could not read the request body: an uploaded file's name is {len} \
+                     characters long; the limit is {MAX_UPLOAD_FILENAME_CHARS}."
+                ),
+            );
+        }
+        MultipartRejection::Multer(err) => err,
+    };
     let over_limit = matches!(
         err,
         multer::Error::StreamSizeExceeded { .. } | multer::Error::FieldSizeExceeded { .. }
@@ -3439,22 +3783,8 @@ async fn handle_request_inner(
     let method = parts.method.to_string();
     let remote_addr = addr.ip().to_string();
     let url = parts.uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/").to_string();
-    // `--max-memory` back-pressure: over the soft limit, refuse with 503 and a
-    // Retry-After before touching the body or the VM. The enforcer has already
-    // kicked a shed pass; in-flight requests finish normally.
-    if let Some(fp) = memory_limit::enforcer().and_then(|e| e.check_admission()) {
-        let limit = memory_limit::enforcer().map(|e| e.limit().max).unwrap_or(0);
-        return axum::response::Response::builder()
-            .status(503)
-            .header("Retry-After", memory_limit::RETRY_AFTER_SECS.to_string())
-            .header("Content-Type", "text/plain; charset=utf-8")
-            .body(axum::body::Body::from(format!(
-                "503 Service Unavailable: process memory {} is over the configured limit {} (--max-memory); shedding, retry shortly\n",
-                memory_limit::human(fp),
-                memory_limit::human(limit)
-            )))
-            .unwrap();
-    }
+    // (`--max-memory` admission and the concurrency gate have already run in
+    // `handle_request`, before this is called.)
 
     // Extract headers as Vec<(String, String)>
     let mut headers: Vec<(String, String)> = parts.headers.iter()
@@ -3494,8 +3824,38 @@ async fn handle_request_inner(
     // background work (GH #386).
     let mut uploads = cfml_vm::upload_temp::UploadTempFiles::new();
     let mut body = body;
+    // `server.bodyReadTimeout`: the whole body must arrive within this many
+    // seconds of the server starting to read it, on both paths below. A
+    // client that declares a Content-Length and then trickles (or stops)
+    // otherwise holds its blocking slot and connection forever — hyper's
+    // header timeout only covers the header block. `0` = no limit.
+    let body_timeout = match state.cfconfig.server.body_read_timeout {
+        0 => None,
+        secs => Some(std::time::Duration::from_secs(u64::from(secs))),
+    };
     if let Some(ct) = multipart_ct {
-        match stream_multipart_form(body, &ct, body_limit, &mut uploads).await {
+        let read = stream_multipart_form(
+            body,
+            &ct,
+            body_limit,
+            state.cfconfig.server.max_multipart_parts,
+            &mut uploads,
+        );
+        let read = match body_timeout {
+            Some(limit) => match tokio::time::timeout(limit, read).await {
+                Ok(r) => r,
+                Err(_) => {
+                    return body_read_timeout_response(
+                        &method,
+                        &url,
+                        &parts.headers,
+                        state.cfconfig.server.body_read_timeout,
+                    )
+                }
+            },
+            None => read.await,
+        };
+        match read {
             Ok(form) => {
                 streamed_form = Some(form);
                 body = axum::body::Body::empty();
@@ -3529,7 +3889,22 @@ async fn handle_request_inner(
     // uploader chasing a size limit it never came close to — we shipped exactly
     // that, logging "exceeds maxRequestBodySize (209715200 bytes)" for a request
     // whose declared content-length was 23282.
-    let body_bytes = match axum::body::to_bytes(body, body_limit).await {
+    let read = axum::body::to_bytes(body, body_limit);
+    let read = match body_timeout {
+        Some(limit) => match tokio::time::timeout(limit, read).await {
+            Ok(r) => r,
+            Err(_) => {
+                return body_read_timeout_response(
+                    &method,
+                    &url,
+                    &parts.headers,
+                    state.cfconfig.server.body_read_timeout,
+                )
+            }
+        },
+        None => read.await,
+    };
+    let body_bytes = match read {
         Ok(bytes) => bytes,
         Err(e) => {
             let declared = parts
@@ -3619,19 +3994,21 @@ async fn handle_request_inner(
             match result.rewrite_type {
                 rewrite::RewriteType::PermanentRedirect => {
                     log::debug!("  -> 301 redirect to {}", result.new_path);
-                    return axum::response::Response::builder()
-                        .status(301)
-                        .header("Location", &result.new_path)
-                        .body(axum::body::Body::empty())
-                        .unwrap();
+                    return finish_response(
+                        axum::response::Response::builder()
+                            .status(301)
+                            .header("Location", &result.new_path),
+                        axum::body::Body::empty(),
+                    );
                 }
                 rewrite::RewriteType::Redirect => {
                     log::debug!("  -> 302 redirect to {}", result.new_path);
-                    return axum::response::Response::builder()
-                        .status(302)
-                        .header("Location", &result.new_path)
-                        .body(axum::body::Body::empty())
-                        .unwrap();
+                    return finish_response(
+                        axum::response::Response::builder()
+                            .status(302)
+                            .header("Location", &result.new_path),
+                        axum::body::Body::empty(),
+                    );
                 }
                 rewrite::RewriteType::Forward => {
                     if result.new_path != path {
@@ -3688,11 +4065,12 @@ async fn handle_request_inner(
     if is_admin_endpoint {
         if let Some(code) = rewrite_status.filter(|c| *c >= 400) {
             log::debug!("  -> {} (admin endpoint refused by a rewrite rule)", code);
-            return axum::response::Response::builder()
-                .status(code)
-                .header("Content-Type", "text/plain; charset=utf-8")
-                .body(axum::body::Body::from("Not found"))
-                .unwrap();
+            return finish_response(
+                axum::response::Response::builder()
+                    .status(code)
+                    .header("Content-Type", "text/plain; charset=utf-8"),
+                axum::body::Body::from("Not found"),
+            );
         }
         // Sampling-profiler admin endpoint (Phase 2): recent profiled requests
         // as JSON, only while the profiler is armed.
@@ -3974,20 +4352,22 @@ async fn handle_request_inner(
                 b
             };
             if not_modified {
-                return with_validators(axum::response::Response::builder().status(304))
-                    .body(axum::body::Body::empty())
-                    .unwrap();
+                return finish_response(
+                    with_validators(axum::response::Response::builder().status(304)),
+                    axum::body::Body::empty(),
+                );
             }
             match state.vfs.read(&path_str) {
                 Ok(data) => {
                     let ct = content_type_for(&rf.file_path);
-                    with_validators(
-                        axum::response::Response::builder()
-                            .status(200)
-                            .header("Content-Type", ct),
+                    finish_response(
+                        with_validators(
+                            axum::response::Response::builder()
+                                .status(200)
+                                .header("Content-Type", ct),
+                        ),
+                        axum::body::Body::from(data),
                     )
-                    .body(axum::body::Body::from(data))
-                    .unwrap()
                 }
                 Err(_) => {
                     axum::response::Response::builder()
@@ -4194,7 +4574,34 @@ fn build_streaming_response(
             .map(|chunk| (Ok::<bytes::Bytes, std::io::Error>(chunk), rx))
     });
 
-    builder.body(axum::body::Body::from_stream(stream)).unwrap()
+    finish_response(builder, axum::body::Body::from_stream(stream))
+}
+
+/// Turn a response builder into a response WITHOUT unwrapping. The builder
+/// carries the first error it met — a status outside 100..=999, a header name
+/// that is not a token, a value with a CR/LF — and every one of those can come
+/// from CFML (`cfheader`, `cfcookie`, `cflocation`, `cfcontent`). The VM now
+/// validates those at the tag, but the server must never panic on a value it
+/// did not build itself: a panic here killed the worker thread for that
+/// request, so any remaining path (or a future one) degrades to a 500.
+fn finish_response(
+    builder: axum::http::response::Builder,
+    body: axum::body::Body,
+) -> axum::response::Response<axum::body::Body> {
+    match builder.body(body) {
+        Ok(resp) => resp,
+        Err(e) => {
+            log::error!("could not build HTTP response: {}", e);
+            axum::response::Response::builder()
+                .status(axum::http::StatusCode::INTERNAL_SERVER_ERROR)
+                .header("Content-Type", "text/plain; charset=utf-8")
+                .body(axum::body::Body::from(format!(
+                    "500 Internal Server Error: invalid response header or status ({})",
+                    e
+                )))
+                .unwrap_or_default()
+        }
+    }
 }
 
 /// Build the HTTP response for a successful CFML execution: honour a
@@ -4232,7 +4639,7 @@ fn build_success_response(
                 );
             }
         }
-        return builder.body(axum::body::Body::empty()).unwrap();
+        return finish_response(builder, axum::body::Body::empty());
     }
 
     // Resolve the singleton Content-Type and de-duplicate other
@@ -4282,7 +4689,7 @@ fn build_success_response(
         }
     }
 
-    builder.body(body).unwrap()
+    finish_response(builder, body)
 }
 
 use cfml_vm::web::{ResolvedFile, resolve_file};

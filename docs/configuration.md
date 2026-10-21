@@ -157,9 +157,12 @@ overlay. There is intentionally **no `port` key**: the listening port is set wit
 | `webroot` | string | `""` | Document root. Overridden by `--serve <path>` |
 | `welcomeFiles` | string[] | `["index.cfm", "index.htm", "index.html"]` | Tried in order for directory requests |
 | `cfmlExtensions` | string[] | `["cfm", "cfc"]` | Extensions dispatched through the interpreter |
-| `maxRequestBodySize` | int (bytes) | `10485760` | `0` = unlimited |
-| `maxConcurrentRequests` | int | `0` | `0` = unlimited (reserved; not enforced yet) |
-| `requestTimeout` | int (sec) | `0` | `0` = no timeout (reserved; not enforced yet) |
+| `maxRequestBodySize` | int (bytes) | `209715200` (200 MB) | `0` = unlimited. Over the limit the request gets **413** |
+| `maxMultipartParts` | int | `1000` | Parts per `multipart/form-data` body; `0` = unlimited. Over the limit the request gets **413** |
+| `requestTimeout` | int (sec) | `0` | `0` = no timeout. Bounds CFML execution; see [known-issues §3](known-issues.md) for what it does and does not interrupt |
+| `maxConcurrentRequests` | int | `0` | `0` = 4 × available CPU cores. See [Overload protection](#overload-protection) |
+| `headerReadTimeout` | int (sec) | `30` | `0` = no limit. See [Overload protection](#overload-protection) |
+| `bodyReadTimeout` | int (sec) | `60` | `0` = no limit. See [Overload protection](#overload-protection) |
 
 ### `runtime`
 
@@ -728,6 +731,28 @@ component {
 
 `this.cache` definitions merge with and override same-named entries from `.cfconfig.json`.
 `this.sessionStorage` overrides the server-wide `sessionStorage` for this application.
+
+## Overload protection
+
+Three `server` keys keep a slow or hostile client from pinning the server.
+The defaults suit a server behind a reverse proxy or facing the internet
+directly; raise them only for clients you know to be slow.
+
+| Key | Default | What it bounds | On breach |
+|---|---|---|---|
+| `headerReadTimeout` | `30` s | Time from accepting a connection to receiving its complete request header block. The slowloris shape: a header line trickled in a byte at a time, never finished | The connection is closed. There is no request yet, so nothing is sent |
+| `bodyReadTimeout` | `60` s | Time from the server starting to read the request body to receiving all of it — both the streamed `multipart/form-data` path and buffered bodies. A `Content-Length` that is declared and never delivered | **408 Request Timeout**, `Connection: close` |
+| `maxConcurrentRequests` | `0` = 4 × CPU cores | Requests running through the CFML/static handler at once. WebSocket connections and `cfthread` bodies are not counted | The request waits up to 2 s for a slot, then **503** with `Retry-After: 1` |
+
+`requestTimeout` bounds the template itself; when it is set, the whole
+request is additionally capped at `requestTimeout + bodyReadTimeout`, so a
+request can never outlive both (a **503** once that passes). `0` disables any
+of the timeouts; `maxConcurrentRequests: 0` means the core-based default, not
+unlimited.
+
+A `--max-memory` shed (see [Memory](memory.md)) is decided
+before the concurrency gate, so a request the memory enforcer turns away never
+waits for a slot.
 
 ## Inspecting the resolved config from CFML
 

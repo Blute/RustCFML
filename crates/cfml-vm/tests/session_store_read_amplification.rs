@@ -93,6 +93,31 @@ const PAGE: &str = r#"<cfscript>
     session.visits = ( session.visits ?: 0 ) + 1;
 </cfscript>"#;
 
+/// Make `sid` KNOWN to the store — straight into the inner map, so the seed
+/// is not counted as a read. An id the store has never issued is not adopted
+/// (session fixation), and this test measures the reads an ESTABLISHED
+/// session costs, so the first request must already find one.
+fn seed(store: &CountingStore, sid: &str) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    store.inner.set(
+        APP_NAME,
+        sid,
+        SessionData {
+            variables: ValueMap::default(),
+            created_secs: now,
+            last_accessed_secs: now,
+            auth_user: None,
+            auth_roles: Vec::new(),
+            timeout_secs: 3600,
+            app_name: APP_NAME.to_string(),
+            live: None,
+        },
+    );
+}
+
 fn run_request(store: Arc<dyn SessionStore>, sid: &str) {
     let mut files: HashMap<String, Vec<u8>> = HashMap::new();
     files.insert("Application.cfc".to_string(), APP.as_bytes().to_vec());
@@ -135,7 +160,7 @@ fn run_request(store: Arc<dyn SessionStore>, sid: &str) {
 }
 
 fn visits(data: &SessionData) -> i64 {
-    data.variables
+    data.variables_snapshot()
         .iter()
         .find(|(k, _)| k.eq_ignore_ascii_case("visits"))
         .and_then(|(_, v)| v.as_string().trim().parse::<i64>().ok())
@@ -146,8 +171,9 @@ fn visits(data: &SessionData) -> i64 {
 fn a_remote_store_is_read_once_per_request() {
     let store = Arc::new(CountingStore::new(false));
     let sid = "sid-remote";
+    seed(&store, sid);
 
-    // Request 1 creates the record.
+    // Request 1 writes the first visit into the record.
     run_request(store.clone() as Arc<dyn SessionStore>, sid);
     store.reset();
 
@@ -174,6 +200,7 @@ fn a_cheap_store_keeps_re_reading() {
     // `reads_are_cheap` split has been lost.
     let store = Arc::new(CountingStore::new(true));
     let sid = "sid-cheap";
+    seed(&store, sid);
 
     run_request(store.clone() as Arc<dyn SessionStore>, sid);
     store.reset();

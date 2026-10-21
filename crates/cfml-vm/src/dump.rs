@@ -412,6 +412,13 @@ fn depth_exceeded(out: &mut String, opts: &DumpOptions, depth: usize) -> bool {
             return true;
         }
     }
+    // The renderer recurses once per container level; a value nested deeper
+    // than the native stack holds (a 100k-deep array of arrays) overflowed
+    // it — an abort. Truncate with a marker, as `top` does.
+    if !cfml_common::stack_guard::has_headroom(cfml_common::stack_guard::WALK_RED_ZONE) {
+        out.push_str("<div class=\"rcf-empty\">\u{2026} (nesting too deep to render)</div>");
+        return true;
+    }
     false
 }
 
@@ -534,12 +541,27 @@ fn render_text(value: &CfmlValue, indent: usize, out: &mut String, visited: &mut
 }
 
 fn render_text_child(value: &CfmlValue, indent: usize, out: &mut String, visited: &mut Vec<usize>) {
+    // Same native-stack truncation as the HTML renderer's `depth_exceeded`.
+    let can_descend = |out: &mut String| {
+        if cfml_common::stack_guard::has_headroom(cfml_common::stack_guard::WALK_RED_ZONE) {
+            true
+        } else {
+            out.push_str("… (nesting too deep to render)\n");
+            false
+        }
+    };
     match value {
         CfmlValue::Array(_) | CfmlValue::Struct(_) | CfmlValue::Query(_) | CfmlValue::Component(_) => {
-            render_text(value, indent, out, visited)
+            if can_descend(out) {
+                render_text(value, indent, out, visited)
+            }
         }
         #[cfg(feature = "component-instance")]
-        CfmlValue::Instance(_) => render_text(value, indent, out, visited),
+        CfmlValue::Instance(_) => {
+            if can_descend(out) {
+                render_text(value, indent, out, visited)
+            }
+        }
         _ => {
             out.push_str(&value_string(value));
             out.push('\n');

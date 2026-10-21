@@ -6642,7 +6642,7 @@ pub fn fn_serialize_json(args: Vec<CfmlValue>) -> CfmlResult {
     // DATA (array of row arrays); true emits column-oriented DATA (a struct
     // keyed by uppercased column name) plus a ROWCOUNT. Matches Lucee 6.
     let qfmt = QueryJsonFormat::from_arg(args.get(1));
-    let body = serialize_value(args.first().unwrap_or(&CfmlValue::Null), &mut visited, qfmt);
+    let body = serialize_value(args.first().unwrap_or(&CfmlValue::Null), &mut visited, qfmt)?;
     let flags = security_flags();
     if flags.secure_json && !flags.secure_json_prefix.is_empty() {
         Ok(CfmlValue::string(format!("{}{}", flags.secure_json_prefix, body)))
@@ -6651,10 +6651,49 @@ pub fn fn_serialize_json(args: Vec<CfmlValue>) -> CfmlResult {
     }
 }
 
-fn serialize_value(val: &CfmlValue, visited: &mut Vec<usize>, qfmt: QueryJsonFormat) -> String {
+// Depth at which the JSON writer stops descending into a container. A
+// recursive walk over a value nested deeper than this would exhaust the
+// native stack — an ABORT, not an error — so the walk marks the overflow
+// and `serialize_value` turns it into a CFML error. Lucee throws a
+// `StackOverflowError` at a similar depth (a few thousand); the exact figure
+// here is whatever the thread's stack holds (see `cfml_common::stack_guard`).
+thread_local! {
+    /// Container depth at which the current walk ran out of stack (0 = none).
+    static JSON_WALK_OVERFLOW_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// True when the writer may descend one more container level (`depth` is the
+/// number of containers already open); records the overflow and writes `null`
+/// for the subtree when it may not.
+fn json_walk_can_descend(out: &mut String, depth: usize) -> bool {
+    if cfml_common::stack_guard::has_headroom(cfml_common::stack_guard::WALK_RED_ZONE) {
+        return true;
+    }
+    JSON_WALK_OVERFLOW_DEPTH.with(|f| {
+        if f.get() == 0 {
+            f.set(depth.max(1));
+        }
+    });
+    out.push_str("null");
+    false
+}
+
+fn serialize_value(
+    val: &CfmlValue,
+    visited: &mut Vec<usize>,
+    qfmt: QueryJsonFormat,
+) -> Result<String, CfmlError> {
     let mut out = String::new();
+    JSON_WALK_OVERFLOW_DEPTH.with(|f| f.set(0));
     write_json_value(val, &mut out, visited, qfmt);
-    out
+    let overflow_depth = JSON_WALK_OVERFLOW_DEPTH.with(|f| f.replace(0));
+    if overflow_depth > 0 {
+        return Err(CfmlError::runtime(format!(
+            "serializeJSON: value nesting too deep ({} levels of nested containers exhausted the native stack)",
+            overflow_depth
+        )));
+    }
+    Ok(out)
 }
 
 /// Append `s` to `out` as a JSON string literal — the same escaping as
@@ -6720,6 +6759,12 @@ fn write_json_value(val: &CfmlValue, out: &mut String, visited: &mut Vec<usize>,
                 }
                 visited.push(p);
             }
+            if !json_walk_can_descend(out, visited.len()) {
+                if id.is_some() {
+                    visited.pop();
+                }
+                return;
+            }
             let data = comp.instance_serialize_data();
             out.push('{');
             let mut first = true;
@@ -6769,6 +6814,9 @@ fn write_json_value(val: &CfmlValue, out: &mut String, visited: &mut Vec<usize>,
                 out.push_str("null");
                 return;
             }
+            if !json_walk_can_descend(out, visited.len()) {
+                return;
+            }
             visited.push(ptr);
             out.push('[');
             let mut first = true;
@@ -6788,6 +6836,9 @@ fn write_json_value(val: &CfmlValue, out: &mut String, visited: &mut Vec<usize>,
                 out.push_str("null");
                 return;
             }
+            if !json_walk_can_descend(out, visited.len()) {
+                return;
+            }
             visited.push(ptr);
             write_json_struct(s, out, visited, qfmt);
             visited.pop();
@@ -6800,6 +6851,9 @@ fn write_json_value(val: &CfmlValue, out: &mut String, visited: &mut Vec<usize>,
             // (serializeQueryByColumns=true) is a struct keyed by UPPERCASED
             // column name, and the envelope leads with ROWCOUNT. Verified vs
             // Lucee 6. See GH #231's sibling, GH #232.
+            if !json_walk_can_descend(out, visited.len()) {
+                return;
+            }
             q.with_read(|d| {
                 let row_count = d.row_count();
                 let write_columns = |out: &mut String| {
@@ -7144,11 +7198,29 @@ pub fn fn_deserialize_json(args: Vec<CfmlValue>) -> CfmlResult {
         // match the reference engine instead of rejecting valid-per-CFML input.
         // On lenient failure, surface the original strict error text (Lucee still
         // rejects genuinely malformed JSON such as `{a:1 b:2}`).
-        Err(strict_err) => parse_lenient_json(&json)
-            .map_err(|_| CfmlError::runtime(format!("Invalid JSON: {}", strict_err)))?,
+        Err(strict_err) => parse_lenient_json(&json).map_err(|lenient_err| {
+            // The depth limit is the lenient parser's own finding (serde_json
+            // gave up at ITS limit, 128, long before): report it as such, not
+            // as "Invalid JSON".
+            if lenient_err.starts_with(JSON_TOO_DEEP) {
+                CfmlError::runtime(lenient_err)
+            } else {
+                CfmlError::runtime(format!("Invalid JSON: {}", strict_err))
+            }
+        })?,
     };
     Ok(serde_json_to_cfml_strict(value, strict))
 }
+
+/// Maximum container nesting `deserializeJSON`/`isJSON` accept. serde_json's
+/// own limit is 128; the lenient fallback parser is a recursive descent with
+/// NO limit, so `deserializeJSON(repeatString("[", 200000) & …)` went straight
+/// through it and overflowed the native stack — an abort of the whole server,
+/// not an error. 512 is well above any JSON a real API exchanges and well
+/// inside what the thread's stack holds (`serde_json_to_cfml_strict` and the
+/// `serde_json::Value` drop recurse to the same depth).
+pub const JSON_MAX_DEPTH: usize = 512;
+const JSON_TOO_DEEP: &str = "JSON nesting too deep";
 
 /// Lenient (Lucee/ACF-compatible) JSON parser used only as a fallback when strict
 /// `serde_json` parsing fails. Matches Lucee 7's `deserializeJSON` leniency set:
@@ -7158,7 +7230,7 @@ pub fn fn_deserialize_json(args: Vec<CfmlValue>) -> CfmlResult {
 fn parse_lenient_json(input: &str) -> Result<serde_json::Value, String> {
     let chars: Vec<char> = input.chars().collect();
     let mut pos = 0usize;
-    let value = parse_lenient_value(&chars, &mut pos)?;
+    let value = parse_lenient_value(&chars, &mut pos, 0)?;
     skip_ws_comments(&chars, &mut pos);
     if pos != chars.len() {
         return Err(format!("unexpected trailing characters at column {}", pos + 1));
@@ -7188,20 +7260,28 @@ fn skip_ws_comments(chars: &[char], pos: &mut usize) {
     }
 }
 
-fn parse_lenient_value(chars: &[char], pos: &mut usize) -> Result<serde_json::Value, String> {
+/// `depth` is the number of containers already open; a container at
+/// `JSON_MAX_DEPTH` is refused (see the constant for why).
+fn parse_lenient_value(chars: &[char], pos: &mut usize, depth: usize) -> Result<serde_json::Value, String> {
     skip_ws_comments(chars, pos);
     if *pos >= chars.len() {
         return Err("unexpected end of JSON input".to_string());
     }
     match chars[*pos] {
-        '{' => parse_lenient_object(chars, pos),
-        '[' => parse_lenient_array(chars, pos),
+        '{' | '[' if depth >= JSON_MAX_DEPTH => Err(format!(
+            "{}: more than {} nested levels at column {}",
+            JSON_TOO_DEEP,
+            JSON_MAX_DEPTH,
+            *pos + 1
+        )),
+        '{' => parse_lenient_object(chars, pos, depth + 1),
+        '[' => parse_lenient_array(chars, pos, depth + 1),
         '"' | '\'' => Ok(serde_json::Value::String(parse_lenient_string(chars, pos)?)),
         _ => parse_lenient_literal(chars, pos),
     }
 }
 
-fn parse_lenient_object(chars: &[char], pos: &mut usize) -> Result<serde_json::Value, String> {
+fn parse_lenient_object(chars: &[char], pos: &mut usize, depth: usize) -> Result<serde_json::Value, String> {
     *pos += 1; // consume '{'
     let mut map = serde_json::Map::new();
     loop {
@@ -7223,7 +7303,7 @@ fn parse_lenient_object(chars: &[char], pos: &mut usize) -> Result<serde_json::V
             return Err(format!("expected ':' after key at column {}", *pos + 1));
         }
         *pos += 1; // consume ':'
-        let val = parse_lenient_value(chars, pos)?;
+        let val = parse_lenient_value(chars, pos, depth)?;
         map.insert(key, val);
         skip_ws_comments(chars, pos);
         if *pos >= chars.len() {
@@ -7243,7 +7323,7 @@ fn parse_lenient_object(chars: &[char], pos: &mut usize) -> Result<serde_json::V
     Ok(serde_json::Value::Object(map))
 }
 
-fn parse_lenient_array(chars: &[char], pos: &mut usize) -> Result<serde_json::Value, String> {
+fn parse_lenient_array(chars: &[char], pos: &mut usize, depth: usize) -> Result<serde_json::Value, String> {
     *pos += 1; // consume '['
     let mut arr = Vec::new();
     loop {
@@ -7255,7 +7335,7 @@ fn parse_lenient_array(chars: &[char], pos: &mut usize) -> Result<serde_json::Va
             *pos += 1;
             break;
         }
-        arr.push(parse_lenient_value(chars, pos)?);
+        arr.push(parse_lenient_value(chars, pos, depth)?);
         skip_ws_comments(chars, pos);
         if *pos >= chars.len() {
             return Err("unterminated array".to_string());
@@ -8068,7 +8148,7 @@ fn fn_duplicate(args: Vec<CfmlValue>) -> CfmlResult {
         return Ok(CfmlValue::Null);
     };
     let deep = args.get(1).map(|f| f.is_true()).unwrap_or(true);
-    Ok(if deep { v.deep_copy() } else { v.shallow_copy() })
+    Ok(if deep { v.deep_copy_checked()? } else { v.shallow_copy() })
 }
 
 fn fn_sleep(args: Vec<CfmlValue>) -> CfmlResult {
@@ -17355,13 +17435,13 @@ fn fn_jwt_sign(args: Vec<CfmlValue>) -> CfmlResult {
                 }
             }
             let mut visited = Vec::new();
-            serialize_value(&CfmlValue::strukt(map), &mut visited, QueryJsonFormat::Row)
+            serialize_value(&CfmlValue::strukt(map), &mut visited, QueryJsonFormat::Row)?
         }
         CfmlValue::String(s) => (**s).clone(),
         CfmlValue::Null => "{}".to_string(),
         other => {
             let mut visited = Vec::new();
-            serialize_value(other, &mut visited, QueryJsonFormat::Row)
+            serialize_value(other, &mut visited, QueryJsonFormat::Row)?
         }
     };
     let payload_b64 = base64url_encode(payload_json.as_bytes());
@@ -17686,6 +17766,12 @@ fn xml_inject_named_children(element: &mut ValueMap) {
     }
 }
 
+/// Maximum element nesting `xmlParse` builds (and `isXML` accepts). The
+/// element tree is walked recursively by everything downstream, and
+/// `xmlParse(repeatString("<a>", 100000) & …)` overflowed the native stack —
+/// an abort of the whole process. Real documents are a few dozen deep.
+pub const XML_MAX_DEPTH: usize = 1024;
+
 #[cfg(feature = "xml")]
 fn fn_xml_parse(args: Vec<CfmlValue>) -> CfmlResult {
     use quick_xml::Reader;
@@ -17700,6 +17786,17 @@ fn fn_xml_parse(args: Vec<CfmlValue>) -> CfmlResult {
     loop {
         match reader.read_event() {
             Ok(Event::Start(ref e)) => {
+                // The parse itself is iterative, but every later walk of the
+                // DOM (toString, xmlSearch, duplicate, serializeJSON — and the
+                // drop of the tree) recurses once per level, so an unbounded
+                // depth is an abort waiting to happen downstream. Refuse it here.
+                if stack.len() >= XML_MAX_DEPTH {
+                    return Err(CfmlError::runtime(format!(
+                        "XML nesting too deep: more than {} nested elements (at <{}>)",
+                        XML_MAX_DEPTH,
+                        String::from_utf8_lossy(e.name().as_ref())
+                    )));
+                }
                 let mut element = ValueMap::default();
                 let tag_name = String::from_utf8_lossy(e.name().as_ref()).to_string();
                 element.insert("xmlName".to_string(), CfmlValue::string(tag_name));
@@ -17880,6 +17977,10 @@ fn fn_is_xml(args: Vec<CfmlValue>) -> CfmlResult {
             Ok(Event::Start(_)) => {
                 found_element = true;
                 depth += 1;
+                // Deeper than `xmlParse` will build is "not XML" to the engine.
+                if depth as usize > XML_MAX_DEPTH {
+                    return Ok(CfmlValue::Bool(false));
+                }
             }
             Ok(Event::Empty(_)) => {
                 found_element = true;
@@ -19361,15 +19462,15 @@ fn fn_cfcookie_stub(_args: Vec<CfmlValue>) -> CfmlResult {
 
 // ---- File Upload functions ----
 
-/// fileUpload(destination, formField, accept, nameConflict)
+/// fileUpload(destination, formField, accept, nameConflict, strict,
+///            allowedExtensions, blockedExtensions)
 fn fn_file_upload(args: Vec<CfmlValue>) -> CfmlResult {
     let destination = get_str(&args, 0);
-    let _form_field = get_str(&args, 1);
-    let _accept = if args.len() > 2 { get_str(&args, 2) } else { String::new() };
     let name_conflict = if args.len() > 3 { get_str(&args, 3).to_lowercase() } else { "error".to_string() };
 
-    // This is a stub — real implementation requires VM access to the form scope
-    // to find the uploaded file's temp path. The VM intercepts this.
+    // This is a stub — the real implementation needs the form scope for the
+    // uploaded file's temp path and enforces accept/strict and the extension
+    // lists there (`cfml-vm/src/intercepts_upload.rs`). The VM intercepts this.
     let mut result = ValueMap::default();
     result.insert("serverDirectory".to_string(), CfmlValue::string(destination));
     result.insert("nameConflict".to_string(), CfmlValue::string(name_conflict));
@@ -19377,11 +19478,10 @@ fn fn_file_upload(args: Vec<CfmlValue>) -> CfmlResult {
     Ok(CfmlValue::strukt(result))
 }
 
-/// fileUploadAll(destination, accept, nameConflict)
+/// fileUploadAll(destination, accept, nameConflict, strict, allowedExtensions,
+///               blockedExtensions) — VM-intercepted like fileUpload.
 fn fn_file_upload_all(args: Vec<CfmlValue>) -> CfmlResult {
     let destination = get_str(&args, 0);
-    let _accept = if args.len() > 1 { get_str(&args, 1) } else { String::new() };
-    let _name_conflict = if args.len() > 2 { get_str(&args, 2).to_lowercase() } else { "error".to_string() };
 
     let mut result = ValueMap::default();
     result.insert("serverDirectory".to_string(), CfmlValue::string(destination));
@@ -19389,7 +19489,9 @@ fn fn_file_upload_all(args: Vec<CfmlValue>) -> CfmlResult {
     Ok(CfmlValue::strukt(result))
 }
 
-/// __cffile_upload(destination, formField, accept, nameConflict) - generated by <cffile action="upload">
+/// __cffile_upload({ action, destination, fileField, accept, ... }) - generated by
+/// <cffile action="upload"|"uploadAll">; VM-intercepted, this stub only answers
+/// a CLI run with no request.
 fn fn_cffile_upload(args: Vec<CfmlValue>) -> CfmlResult {
     fn_file_upload(args)
 }
@@ -21055,10 +21157,29 @@ fn fn_cfzip(args: Vec<CfmlValue>) -> CfmlResult {
                     continue;
                 }
 
+                // The entry name is attacker-controlled: `../x` and `/etc/x`
+                // used to be joined onto `dest` as-is and written wherever
+                // they pointed (zip-slip). `enclosed_name` is `None` for any
+                // name that is absolute or climbs out of its own root, and the
+                // archive is refused outright rather than partially extracted,
+                // as Lucee does.
+                let safe_name = match entry.enclosed_name() {
+                    Some(p) => p,
+                    None => {
+                        return Err(CfmlError::runtime(format!(
+                            "cfzip: entry [{}] in [{}] would be written outside the destination [{}]; \
+                             the archive was not extracted",
+                            name, file_path, destination
+                        )))
+                    }
+                };
                 let out_path = if store_path {
-                    dest.join(&name)
+                    dest.join(&safe_name)
                 } else {
-                    dest.join(std::path::Path::new(&name).file_name().unwrap_or_default())
+                    match safe_name.file_name() {
+                        Some(f) => dest.join(f),
+                        None => continue,
+                    }
                 };
 
                 if entry.is_dir() {
@@ -21954,5 +22075,97 @@ mod pool_idle_sweep {
         assert!(!has("test:stale"), "stale pool still registered");
         assert!(has("test:fresh"), "fresh pool must survive the sweep");
         get_pool_manager().lock().unwrap().remove("test:fresh");
+    }
+}
+
+#[cfg(test)]
+#[cfg(feature = "zip_support")]
+#[cfg(not(target_arch = "wasm32"))]
+mod cfzip_slip_tests {
+    use super::*;
+    use std::io::Write as _;
+    use zip::write::SimpleFileOptions;
+
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "rustcfml_cfzip_{}_{}_{}",
+            tag,
+            std::process::id(),
+            cfml_common::clock::now_unix_millis()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn write_zip(path: &std::path::Path, entries: &[(&str, &[u8])]) {
+        let f = std::fs::File::create(path).unwrap();
+        let mut w = zip::ZipWriter::new(f);
+        let opts = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        for (name, data) in entries {
+            w.start_file(*name, opts).unwrap();
+            w.write_all(data).unwrap();
+        }
+        w.finish().unwrap();
+    }
+
+    fn unzip(file: &std::path::Path, dest: &std::path::Path, store_path: bool) -> CfmlResult {
+        let mut opts = ValueMap::default();
+        opts.insert("action".to_string(), CfmlValue::string("unzip".to_string()));
+        opts.insert("file".to_string(), CfmlValue::string(file.to_string_lossy().to_string()));
+        opts.insert("destination".to_string(), CfmlValue::string(dest.to_string_lossy().to_string()));
+        opts.insert("storepath".to_string(), CfmlValue::Bool(store_path));
+        fn_cfzip(vec![CfmlValue::strukt(opts)])
+    }
+
+    /// `../x` and `/abs` entry names used to be joined onto the destination
+    /// and written where they pointed. The archive is now refused and nothing
+    /// lands outside `dest`.
+    #[test]
+    fn unzip_refuses_entries_that_leave_the_destination() {
+        let base = scratch("slip");
+        let dest = base.join("dest");
+        let abs_target = base.join("abs_escaped.txt");
+        let zip_path = base.join("evil.zip");
+        write_zip(
+            &zip_path,
+            &[
+                ("../zipslip_escaped.txt", b"escaped"),
+                ("ok/inner.txt", b"fine"),
+                (abs_target.to_str().unwrap(), b"absolute"),
+            ],
+        );
+
+        let err = unzip(&zip_path, &dest, true).expect_err("an escaping entry must be refused");
+        let msg = err.to_string();
+        assert!(msg.contains("outside the destination"), "message was: {msg}");
+        assert!(!base.join("zipslip_escaped.txt").exists(), "wrote beside the destination");
+        assert!(!abs_target.exists(), "wrote at an absolute path");
+
+        // Flattened extraction gets the same guard.
+        let dest2 = base.join("dest_flat");
+        unzip(&zip_path, &dest2, false).expect_err("an escaping entry must be refused when flattening");
+        assert!(!base.join("zipslip_escaped.txt").exists());
+        assert!(!abs_target.exists());
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn unzip_extracts_a_well_formed_archive() {
+        let base = scratch("ok");
+        let dest = base.join("dest");
+        let zip_path = base.join("good.zip");
+        write_zip(&zip_path, &[("a/b/c.txt", b"nested"), ("top.txt", b"top")]);
+
+        unzip(&zip_path, &dest, true).expect("a clean archive extracts");
+        assert_eq!(std::fs::read(dest.join("a/b/c.txt")).unwrap(), b"nested");
+        assert_eq!(std::fs::read(dest.join("top.txt")).unwrap(), b"top");
+
+        let flat = base.join("flat");
+        unzip(&zip_path, &flat, false).expect("a clean archive flattens");
+        assert_eq!(std::fs::read(flat.join("c.txt")).unwrap(), b"nested");
+        assert!(!flat.join("a").exists());
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

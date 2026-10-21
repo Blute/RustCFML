@@ -269,6 +269,23 @@ impl SessionStore for DatasourceStore {
         serde_json::from_str(&json).ok()
     }
 
+    fn id_issued(&self, id: &str) -> bool {
+        // One indexed lookup on the primary key's leading column; only runs
+        // when `(app, id)` missed, so it costs nothing on the normal path.
+        self.ensure_schema();
+        let now = now_secs();
+        let sql = format!(
+            "SELECT data FROM {t} WHERE cfid = ? AND expires_at > ?",
+            t = self.table
+        );
+        first_data_cell(self.run(
+            &sql,
+            vec![CfmlValue::string(id.to_string()), CfmlValue::Int(now as i64)],
+            "array",
+        ))
+        .is_some()
+    }
+
     fn set(&self, app: &str, id: &str, data: SessionData) {
         self.ensure_schema();
         let part = self.part(app);
@@ -480,6 +497,7 @@ mod tests {
             auth_roles: Vec::new(),
             timeout_secs: timeout,
             app_name: "appA".to_string(),
+            live: None,
         }
     }
 

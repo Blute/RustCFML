@@ -7,6 +7,7 @@
 
 use cfml_common::dynamic::{CfmlValue, ValueMap};
 use cfml_common::vfs::Vfs;
+use cfml_common::vm::{CfmlError, CfmlErrorType};
 use std::path::{Path, PathBuf};
 
 /// Result of resolving a URL path to a file.
@@ -17,6 +18,18 @@ pub struct ResolvedFile {
     pub script_name: String,
     /// Extra path info after the script (e.g. "/hello/world")
     pub path_info: String,
+}
+
+/// True when a URL path can only name something at or below the document
+/// root: no `..` segment (which would climb out of it), no NUL (which would
+/// truncate the OS path), no backslash (a second separator on Windows that the
+/// segment split below would not see). `.` segments and empty segments
+/// (`//`) are harmless and left alone.
+pub fn url_path_is_contained(url_path: &str) -> bool {
+    if url_path.contains('\0') || url_path.contains('\\') {
+        return false;
+    }
+    !url_path.split('/').any(|seg| seg == "..")
 }
 
 /// Resolve a URL path to a file under `doc_root` using `vfs` for existence
@@ -32,6 +45,15 @@ pub fn resolve_file(
     welcome_files: &[String],
     cfml_extensions: &[String],
 ) -> Option<ResolvedFile> {
+    // Never resolve outside `doc_root`. The URL was joined onto the root as
+    // given, so `GET /../outside/secret.txt` (sent literally — curl
+    // `--path-as-is`, or any raw client) served ANY readable non-CFML file on
+    // the box, in dev and `--production` alike. A `..` segment, a NUL, or a
+    // backslash segment separator has no legitimate meaning in a URL path, so
+    // the request is simply "no such file" (404) rather than normalised.
+    if !url_path_is_contained(url_path) {
+        return None;
+    }
     let relative = url_path.trim_start_matches('/');
 
     let try_welcome_in = |dir: &Path, rel: &str| -> Option<ResolvedFile> {
@@ -443,6 +465,124 @@ pub fn insert_query_value(map: &mut ValueMap, key: String, value: String) {
 /// these; per HTTP semantics the last value wins. See issue #148.
 pub const SINGLETON_RESPONSE_HEADERS: [&str; 3] =
     ["content-type", "content-length", "location"];
+
+/// Validate an HTTP status code set from CFML (`cfheader statusCode=`,
+/// `cflocation statusCode=`, `getPageContext().getResponse().setStatus()`).
+///
+/// Lucee passes the value straight to the servlet container, which rejects
+/// anything the status line cannot carry; hyper's `StatusCode` only holds
+/// 100..=999 and a value outside 100..=599 is not a defined HTTP status at
+/// all. Without this check the server's response builder failed and the
+/// worker PANICKED on `<cfheader statusCode="1000">`. Throws a CFML
+/// `application` error naming the offending value instead.
+pub fn validate_status_code(code: i64, tag: &str) -> Result<u16, CfmlError> {
+    if (100..=599).contains(&code) {
+        Ok(code as u16)
+    } else {
+        Err(CfmlError::new(
+            format!(
+                "{}: statusCode [{}] is not a valid HTTP status code (must be 100-599)",
+                tag, code
+            ),
+            CfmlErrorType::Application,
+        ))
+    }
+}
+
+/// Validate a response header name set from CFML: non-empty and made only
+/// of RFC 7230 `tchar`s (so no whitespace, no CR/LF, no `:`). Anything else
+/// cannot be put on the wire and used to panic the server worker when the
+/// response was built. Throws a CFML `application` error.
+pub fn validate_header_name(name: &str, tag: &str) -> Result<(), CfmlError> {
+    let is_tchar = |c: char| {
+        c.is_ascii_alphanumeric() || "!#$%&'*+-.^_`|~".contains(c)
+    };
+    if name.is_empty() {
+        return Err(CfmlError::new(
+            format!("{}: header name must not be empty", tag),
+            CfmlErrorType::Application,
+        ));
+    }
+    if !name.chars().all(is_tchar) {
+        return Err(CfmlError::new(
+            format!(
+                "{}: header name [{}] contains characters that are not allowed in an HTTP header name",
+                tag,
+                name.escape_default()
+            ),
+            CfmlErrorType::Application,
+        ));
+    }
+    Ok(())
+}
+
+/// Validate a response header value set from CFML: no CR, LF, NUL or other
+/// control characters (tab is allowed by RFC 7230). A CR/LF in a header
+/// value is response splitting — `cfheader name="x" value="a#chr(13)##chr(10)#X-Injected: 1"`
+/// — and it panicked the server worker. RustCFML REJECTS such a value with a
+/// CFML `application` error rather than silently stripping the characters:
+/// Lucee hands the value to the servlet container, and a value the container
+/// cannot send should surface where it was set, not vanish.
+pub fn validate_header_value(name: &str, value: &str, tag: &str) -> Result<(), CfmlError> {
+    if let Some(c) = value.chars().find(|c| c.is_control() && *c != '\t') {
+        let what = match c {
+            '\r' => "a carriage return".to_string(),
+            '\n' => "a line feed".to_string(),
+            '\0' => "a NUL character".to_string(),
+            other => format!("the control character U+{:04X}", other as u32),
+        };
+        return Err(CfmlError::new(
+            format!(
+                "{}: the value of header [{}] contains {}, which is not allowed in an HTTP header",
+                tag, name, what
+            ),
+            CfmlErrorType::Application,
+        ));
+    }
+    Ok(())
+}
+
+/// Validate a redirect target (`cflocation`, `sendRedirect`): it becomes the
+/// `Location` header, so the same control-character rule applies.
+pub fn validate_redirect_url(url: &str, tag: &str) -> Result<(), CfmlError> {
+    validate_header_value("Location", url, tag)
+}
+
+/// Validate one `cfcookie` attribute (name, value, domain, path): none may
+/// carry CR, LF, NUL or another control character — each is spliced into a
+/// single `Set-Cookie` header line, and the cookie name additionally must not
+/// contain the `;`/`=` separators that would change the cookie's meaning.
+pub fn validate_cookie_attr(attr: &str, value: &str) -> Result<(), CfmlError> {
+    if let Some(c) = value.chars().find(|c| c.is_control()) {
+        return Err(CfmlError::new(
+            format!(
+                "cfcookie: the {} [{}] contains a control character (U+{:04X}), which is not allowed in a cookie",
+                attr,
+                value.escape_default(),
+                c as u32
+            ),
+            CfmlErrorType::Application,
+        ));
+    }
+    if attr == "name" {
+        if value.is_empty() {
+            return Err(CfmlError::new(
+                "cfcookie: the cookie name must not be empty".to_string(),
+                CfmlErrorType::Application,
+            ));
+        }
+        if let Some(c) = value.chars().find(|c| matches!(c, ';' | '=' | ',' | ' ')) {
+            return Err(CfmlError::new(
+                format!(
+                    "cfcookie: the name [{}] contains [{}], which is not allowed in a cookie name",
+                    value, c
+                ),
+                CfmlErrorType::Application,
+            ));
+        }
+    }
+    Ok(())
+}
 
 /// Resolve serve-mode response headers, enforcing singleton-header semantics.
 ///
@@ -1195,5 +1335,54 @@ mod tests {
         assert_eq!(url_decode("%+1"), "% 1");
         assert_eq!(url_decode("%zz%4"), "%zz%4");
         assert_eq!(url_decode("%C3%A9"), "\u{e9}");
+    }
+}
+
+#[cfg(test)]
+mod docroot_containment_tests {
+    use super::*;
+    use cfml_common::vfs::RealFs;
+
+    #[test]
+    fn parent_segments_nul_and_backslash_are_rejected() {
+        for p in [
+            "/../outside/secret.txt",
+            "/sub/../../outside/secret.txt",
+            "/..",
+            "../x",
+            "/a/..",
+            "/a\\..\\b",
+            "/a\0b",
+        ] {
+            assert!(!url_path_is_contained(p), "{p:?} must not be contained");
+        }
+    }
+
+    #[test]
+    fn ordinary_paths_are_contained() {
+        for p in ["/", "/index.cfm", "/a/b/c.txt", "/./s.txt", "//s.txt", "/a..b/c", "/...", "/%2e%2e/x"] {
+            assert!(url_path_is_contained(p), "{p:?} must be contained");
+        }
+    }
+
+    /// The real bug: `GET /../outside/secret.txt` resolved to a file ABOVE the
+    /// document root and was served (dev and --production alike).
+    #[test]
+    fn resolve_file_never_climbs_out_of_doc_root() {
+        let tmp = std::env::temp_dir().join(format!("rustcfml_trav_{}", std::process::id()));
+        let root = tmp.join("root");
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::create_dir_all(tmp.join("outside")).unwrap();
+        std::fs::write(tmp.join("outside/secret.txt"), "OUTSIDE").unwrap();
+        std::fs::write(root.join("s.txt"), "static").unwrap();
+        let welcome = vec!["index.cfm".to_string()];
+        let exts = vec!["cfm".to_string(), "cfc".to_string()];
+        let vfs = RealFs;
+
+        assert!(resolve_file(&root, "/s.txt", &vfs, &welcome, &exts).is_some());
+        for p in ["/../outside/secret.txt", "/sub/../../outside/secret.txt", "/sub/../../outside/secret.txt/extra"] {
+            assert!(resolve_file(&root, p, &vfs, &welcome, &exts).is_none(), "{p} escaped the docroot");
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

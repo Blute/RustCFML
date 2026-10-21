@@ -1,6 +1,6 @@
 //! Pluggable session storage backend.
 
-use cfml_common::dynamic::ValueMap;
+use cfml_common::dynamic::{CfmlStruct, ValueMap};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -31,6 +31,25 @@ pub trait SessionStore: Send + Sync + 'static {
     /// Returns `true` if the session exists under `(app, id)`.
     fn contains(&self, app: &str, id: &str) -> bool {
         self.get(app, id).is_some()
+    }
+
+    /// Whether `id` is a session id THIS SERVER issued — held, unexpired, by
+    /// any application. Consulted only when `(app, id)` has no record, to tell
+    /// two cases apart that look identical to a single-app lookup:
+    ///
+    /// - a browser carrying app A's cookie to app B on the same host (cookies
+    ///   are not scoped by port or path): the id must be honoured and B gets
+    ///   its own `(B, id)` session, as on Lucee — otherwise B mints a new id,
+    ///   overwrites the cookie, and the two apps ping-pong, each request
+    ///   losing the other app's session;
+    /// - an id the server never issued (planted by an attacker for session
+    ///   fixation): refused, a fresh id is minted.
+    ///
+    /// The default answers `true` — keep honouring the id — for stores that
+    /// cannot look an id up across applications cheaply (memcached, cluster),
+    /// which therefore keep CF/Lucee's behaviour.
+    fn id_issued(&self, _id: &str) -> bool {
+        true
     }
 
     /// Whether `get` is an in-process lookup a caller may repeat freely.
@@ -149,7 +168,7 @@ impl SessionStore for MemoryStore {
         match self.inner.lock() {
             Ok(g) => g
                 .iter()
-                .map(|(k, d)| (id_from_key(k).to_string(), d.variables.clone()))
+                .map(|(k, d)| (id_from_key(k).to_string(), d.variables_snapshot()))
                 .collect(),
             Err(_) => Vec::new(),
         }
@@ -167,7 +186,20 @@ impl SessionStore for MemoryStore {
                 m.remove(&key);
                 None
             }
-            Some(s) => Some(s.clone()),
+            Some(_) => {
+                // Promote the stored map to the ONE live struct every request of
+                // this session shares (`SessionData::live`). Done under the lock
+                // so two first readers cannot each mint a handle.
+                let s = m.get_mut(&key)?;
+                if s.live.is_none() {
+                    let h = CfmlStruct::new(std::mem::take(&mut s.variables));
+                    // Outlives any request: the cycle collector must treat it
+                    // like application/server scope.
+                    h.mark_persistent_scope();
+                    s.live = Some(h);
+                }
+                Some(s.clone())
+            }
             None => None,
         }
     }
@@ -197,6 +229,18 @@ impl SessionStore for MemoryStore {
         self.get(app, id).is_some()
     }
 
+    fn id_issued(&self, id: &str) -> bool {
+        // A scan, but only on the miss path (a cookie id with no record under
+        // the current app), and a UUID compare per live session.
+        let now = crate::now_epoch_secs();
+        match self.inner.lock() {
+            Ok(m) => m.iter().any(|(k, s)| {
+                id_from_key(k) == id && now.saturating_sub(s.last_accessed_secs) <= s.timeout_secs
+            }),
+            Err(_) => false,
+        }
+    }
+
     fn session_count(&self) -> Option<usize> {
         let now = crate::now_epoch_secs();
         let m = self.inner.lock().ok()?;
@@ -218,7 +262,7 @@ impl SessionStore for MemoryStore {
                 .into_iter()
                 .filter_map(|key| {
                     m.remove(&key)
-                        .map(|s| (s.app_name.clone(), id_from_key(&key).to_string(), s.variables))
+                        .map(|s| (s.app_name.clone(), id_from_key(&key).to_string(), s.variables_snapshot()))
                 })
                 .collect()
         } else {
@@ -249,6 +293,7 @@ mod tests {
             auth_roles: Vec::new(),
             timeout_secs: timeout,
             app_name: app.to_string(),
+            live: None,
         }
     }
 
@@ -277,6 +322,41 @@ mod tests {
         assert_eq!(store.session_count(), Some(3));
     }
 
+    /// Two readers of one session get the SAME struct, and a write through
+    /// either is visible to the other without a `set` — the model Lucee has,
+    /// and the reason two concurrent requests no longer lose each other's
+    /// session writes.
+    #[test]
+    fn get_promotes_to_one_shared_live_struct() {
+        let store = MemoryStore::new();
+        let now = now_epoch_secs();
+        let mut rec = session("appA", now, 1800);
+        rec.variables.insert("init".to_string(), CfmlValue::string("1".to_string()));
+        store.set("appA", "s", rec);
+
+        let a = store.get("appA", "s").unwrap();
+        let b = store.get("appA", "s").unwrap();
+        let (ha, hb) = (a.live.clone().unwrap(), b.live.clone().unwrap());
+        assert!(ha.ptr_eq(&hb), "both readers must hold the one live struct");
+        assert_eq!(ha.snapshot().get("init").unwrap().as_string(), "1", "stored map was promoted");
+
+        ha.insert("slow", CfmlValue::string("a".to_string()));
+        hb.insert("fast", CfmlValue::string("b".to_string()));
+        // A metadata-only write-back (what the request end does for a live
+        // record) must not discard either key.
+        store.set("appA", "s", a.clone());
+        let after = store.get("appA", "s").unwrap().variables_snapshot();
+        assert!(after.contains_key("slow") && after.contains_key("fast"), "{:?}", after.keys().collect::<Vec<_>>());
+        // Expiry drains the live data, not the (now empty) stored map.
+        let mut dying = store.get("appA", "s").unwrap();
+        dying.last_accessed_secs = now - 10_000;
+        dying.timeout_secs = 5;
+        store.set("appA", "s", dying);
+        let drained = store.take_expired(now);
+        assert_eq!(drained.len(), 1);
+        assert!(drained[0].2.contains_key("fast"));
+    }
+
     #[test]
     fn get_returns_live_record() {
         let store = MemoryStore::new();
@@ -301,12 +381,12 @@ mod tests {
         store.set("appB", "shared-cfid", b);
 
         assert_eq!(
-            store.get("appA", "shared-cfid").unwrap().variables.get("x").unwrap().as_string(),
+            store.get("appA", "shared-cfid").unwrap().variables_snapshot().get("x").unwrap().as_string(),
             "alpha",
             "app A keeps its own value"
         );
         assert_eq!(
-            store.get("AppB", "shared-cfid").unwrap().variables.get("x").unwrap().as_string(),
+            store.get("AppB", "shared-cfid").unwrap().variables_snapshot().get("x").unwrap().as_string(),
             "beta",
             "app B is independent and app name is case-insensitive"
         );

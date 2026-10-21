@@ -2232,6 +2232,9 @@ thread_local! {
     /// this guard `{:?}` — used by writeDump and logging — recurses until the
     /// native stack overflows and aborts the whole process (uncatchable SIGABRT).
     static DEBUG_VISITED: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// Set by `deep_copy_guarded` when it ran out of native stack and shared a
+    /// subtree instead of copying it; read (and cleared) by `deep_copy_checked`.
+    static DEEP_COPY_OVERFLOW: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Hand-rolled Debug elides the Arc<_> wrapper on Array/Struct so log diffs
@@ -3268,6 +3271,23 @@ impl CfmlValue {
         self.deep_copy_guarded(&mut seen)
     }
 
+    /// `deep_copy` for the user-facing `duplicate()`: a value nested too deep
+    /// for the native stack to walk is a CFML error, not an abort (a 100k-deep
+    /// array of arrays overflowed the stack here) and not a silently shared
+    /// subtree. Internal callers (component instantiation, MCP handles) copy
+    /// engine-built values of bounded depth and keep the plain `deep_copy`.
+    pub fn deep_copy_checked(&self) -> Result<CfmlValue, crate::vm::CfmlError> {
+        let mut seen: HashMap<usize, CfmlValue> = HashMap::new();
+        DEEP_COPY_OVERFLOW.with(|f| f.set(false));
+        let out = self.deep_copy_guarded(&mut seen);
+        if DEEP_COPY_OVERFLOW.with(|f| f.replace(false)) {
+            return Err(crate::vm::CfmlError::runtime(
+                "duplicate: value nesting too deep — the native stack cannot hold a copy of it".to_string(),
+            ));
+        }
+        Ok(out)
+    }
+
     /// One-level copy — what `duplicate(value, false)` does on Lucee.
     ///
     /// Only the TOP-LEVEL container is copied; every value inside it is shared
@@ -3354,6 +3374,15 @@ impl CfmlValue {
     }
 
     fn deep_copy_guarded(&self, seen: &mut HashMap<usize, CfmlValue>) -> CfmlValue {
+        // Out of native stack: share the rest of this subtree instead of
+        // recursing into an abort, and flag it so `deep_copy_checked` can
+        // throw. Only containers recurse, so only they are checked.
+        if matches!(self, CfmlValue::Array(_) | CfmlValue::Struct(_) | CfmlValue::Query(_) | CfmlValue::NativeObject(_))
+            && !crate::stack_guard::has_headroom(crate::stack_guard::WALK_RED_ZONE)
+        {
+            DEEP_COPY_OVERFLOW.with(|f| f.set(true));
+            return self.clone();
+        }
         match self {
             // A native that knows how to copy itself does; the rest stay
             // shared handles. `try_read`: a native whose method is running

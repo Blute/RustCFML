@@ -1362,12 +1362,17 @@ impl Parser {
             // Parse attributes: variable = "name"
             let mut var_target =
                 AssignTarget::Variable("__savecontent_result".to_string());
+            // Without `variable=` the capture goes to a frame-local temp
+            // (`Statement::Var`), never an unscoped name that lands in a shared
+            // component's `variables` (GH #493 audit).
+            let mut explicit_target = false;
             while !self.check(&Token::LBrace) && !self.is_at_end() {
                 if self.is_identifier_like() && matches!(self.peek(1), Token::Equal) {
                     let attr_name = self.extract_identifier()?;
                     self.advance(); // consume =
                     let attr_value = self.parse_expression()?;
                     if attr_name.to_lowercase() == "variable" {
+                        explicit_target = true;
                         // The variable= target may be unqualified ("cap"), scope-
                         // qualified ("local.cap" → a MemberAccess expr), or a string
                         // literal ("variables.cap"). Lower each to a proper
@@ -1403,19 +1408,28 @@ impl Parser {
                 location: stmt_loc.clone(),
             }));
             stmts.extend(body);
-            stmts.push(Statement::Assignment(Box::new(Assignment {
-                target: var_target,
-                value: Expression::FunctionCall(Box::new(FunctionCall {
-                    name: Box::new(Expression::Identifier(Identifier {
-                        name: "__cfsavecontent_end".to_string(),
-                        location: stmt_loc.clone(),
-                    })),
-                    arguments: vec![],
+            let end_call = Expression::FunctionCall(Box::new(FunctionCall {
+                name: Box::new(Expression::Identifier(Identifier {
+                    name: "__cfsavecontent_end".to_string(),
                     location: stmt_loc.clone(),
                 })),
-                operator: AssignOp::Equal,
+                arguments: vec![],
                 location: stmt_loc.clone(),
-            })));
+            }));
+            stmts.push(if explicit_target {
+                Statement::Assignment(Box::new(Assignment {
+                    target: var_target,
+                    value: end_call,
+                    operator: AssignOp::Equal,
+                    location: stmt_loc.clone(),
+                }))
+            } else {
+                Statement::Var(Var {
+                    name: "__savecontent_result".to_string(),
+                    value: Some(end_call),
+                    location: stmt_loc.clone(),
+                })
+            });
             return Ok(CfmlNode::Statement(Statement::Output(Output {
                 body: stmts,
                 location: stmt_loc,
@@ -2633,6 +2647,14 @@ impl Parser {
                 location: loc,
             }))
         };
+        // `var name = value;` for the SYNTHESISED temporaries below. A plain
+        // `assign` of an undeclared name inside a method lands in the component
+        // `variables` scope, so on an instance shared between requests every
+        // concurrent loop read and wrote one temp (GH #493 audit). User-named
+        // targets keep `assign` (Lucee writes them to `variables` too).
+        let var_tmp = |name: String, value: Expression| {
+            Statement::Var(Var { name, value: Some(value), location: loc })
+        };
         // Unique temp suffix for synthesized loop variables.
         let uniq = self.current;
 
@@ -2732,8 +2754,8 @@ impl Parser {
                 // Hoist the array into a temp so it is evaluated once.
                 return Ok(self.wrap_with_preamble(
                     vec![
-                        assign(arr_tmp.clone(), array),
-                        assign(cap_tmp.clone(), call("arrayLen", vec![ident(&arr_tmp)])),
+                        var_tmp(arr_tmp.clone(), array),
+                        var_tmp(cap_tmp.clone(), call("arrayLen", vec![ident(&arr_tmp)])),
                     ],
                     Statement::For(Box::new(For {
                         init: Some(Box::new(init)),
@@ -2783,7 +2805,7 @@ impl Parser {
                 let increment = bin(ident(&idx_n), BinaryOpType::Assign, bin(ident(&idx_n), BinaryOpType::Add, int(1)));
                 // Hoist the split list into a temp so it is built once.
                 return Ok(self.wrap_with_preamble(
-                    vec![assign(list_tmp.clone(), call("listToArray", vec![list, delims_expr()]))],
+                    vec![var_tmp(list_tmp.clone(), call("listToArray", vec![list, delims_expr()]))],
                     Statement::For(Box::new(For {
                         init: Some(Box::new(init)),
                         condition: Some(cond),
@@ -2821,7 +2843,7 @@ impl Parser {
                 })))];
                 for_body.extend(body);
                 return Ok(self.wrap_with_preamble(
-                    vec![assign(coll_tmp.clone(), collection.clone())],
+                    vec![var_tmp(coll_tmp.clone(), collection.clone())],
                     Statement::ForIn(Box::new(ForIn {
                         var_declared: false,
                         variable: key_n,
@@ -2844,6 +2866,19 @@ impl Parser {
         // 7) query=q (+ optional index|item). Without a binding, reassign the
         //    query variable to the current row each iteration so `q.col` works.
         if let Some(query) = get("query") {
+            // `loop query="q"` names the query as a STRING, exactly like the tag
+            // form (Lucee 7 runs it). Resolve a plain or dotted name to the
+            // variable; otherwise the string itself was hoisted into the temp and
+            // the loop threw `variable [__CFLOOP_QRC_N] doesn't exist`.
+            let query = match &query {
+                Expression::Literal(Literal { value: LiteralValue::String(s), .. })
+                    if !s.is_empty()
+                        && s.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '.' || c == '$') =>
+                {
+                    ident(s)
+                }
+                _ => query,
+            };
             if let Some(binding) = index.clone().or(item.clone()) {
                 let name = var_name(&binding).unwrap_or_else(|| "row".to_string());
                 return Ok(CfmlNode::Statement(Statement::ForIn(Box::new(ForIn {
@@ -2897,8 +2932,8 @@ impl Parser {
             }));
             // Run [hoist…, loop, reset] exactly once via a one-shot `for`.
             let mut once_body = vec![
-                assign(q_tmp.clone(), query),
-                assign(rc_tmp.clone(), ident(&format!("{}.recordcount", q_tmp))),
+                var_tmp(q_tmp.clone(), query),
+                var_tmp(rc_tmp.clone(), ident(&format!("{}.recordcount", q_tmp))),
                 for_loop,
                 set_row(int(1)),
             ];
@@ -3828,8 +3863,31 @@ impl Parser {
                         }
                         other => self.expression_to_assign_target(other)
                             .unwrap_or_else(|_| AssignTarget::Variable("__savecontent_result".to_string())),
-                    })
-                    .unwrap_or_else(|| AssignTarget::Variable("__savecontent_result".to_string()));
+                    });
+                let end_call = Expression::FunctionCall(Box::new(FunctionCall {
+                    name: Box::new(Expression::Identifier(Identifier {
+                        name: "__cfsavecontent_end".to_string(),
+                        location: loc,
+                    })),
+                    arguments: vec![],
+                    location: loc,
+                }));
+                // No `variable=`: a frame-local temp (`Statement::Var`), never an
+                // unscoped name that lands in a shared component's `variables`
+                // (GH #493 audit).
+                let store = match var_target {
+                    Some(target) => Statement::Assignment(Box::new(Assignment {
+                        target,
+                        value: end_call,
+                        operator: AssignOp::Equal,
+                        location: loc,
+                    })),
+                    None => Statement::Var(Var {
+                        name: "__savecontent_result".to_string(),
+                        value: Some(end_call),
+                        location: loc,
+                    }),
+                };
                 let mut stmts = vec![Statement::Expression(ExpressionStatement {
                     expr: Expression::FunctionCall(Box::new(FunctionCall {
                         name: Box::new(Expression::Identifier(Identifier {
@@ -3842,19 +3900,7 @@ impl Parser {
                     location: loc,
                 })];
                 stmts.extend(body);
-                stmts.push(Statement::Assignment(Box::new(Assignment {
-                    target: var_target,
-                    value: Expression::FunctionCall(Box::new(FunctionCall {
-                        name: Box::new(Expression::Identifier(Identifier {
-                            name: "__cfsavecontent_end".to_string(),
-                            location: loc,
-                        })),
-                        arguments: vec![],
-                        location: loc,
-                    })),
-                    operator: AssignOp::Equal,
-                    location: loc,
-                })));
+                stmts.push(store);
                 CfmlNode::Statement(Statement::Output(Output { body: stmts, location: loc }))
             }
             "cfquery" => {
@@ -4142,13 +4188,14 @@ impl Parser {
                         "component" | "method" | "returnvariable" | "argumentcollection"))
                     .map(|(k, v)| (str_lit(k), v.clone()))
                     .collect();
+                // `Var`: the accumulator is frame-local, not the shared
+                // component `variables` scope (GH #493 audit).
                 let mut stmts = vec![
-                    Statement::Assignment(Box::new(Assignment {
-                        target: AssignTarget::Variable("__cfinvoke_args".to_string()),
-                        value: Expression::Struct(Struct { pairs: seed_pairs, ordered: false, location: loc }),
-                        operator: AssignOp::Equal,
+                    Statement::Var(Var {
+                        name: "__cfinvoke_args".to_string(),
+                        value: Some(Expression::Struct(Struct { pairs: seed_pairs, ordered: false, location: loc })),
                         location: loc,
-                    })),
+                    }),
                 ];
                 stmts.extend(body);
                 let args_expr = pick("argumentcollection").unwrap_or_else(||
@@ -4392,13 +4439,14 @@ impl Parser {
                 // Seed the runtime arrays that script-form cfmailpart/cfmailparam
                 // statements in the body append to (mirrors the angle-bracket
                 // runtime cfmail path). __cfmail forwards them as parts/params.
+                // `Var`: frame-local, not the shared component `variables`
+                // scope (GH #493 audit).
                 for arr in ["__cfmail_params", "__cfmail_parts"] {
-                    stmts.push(Statement::Assignment(Box::new(Assignment {
-                        target: AssignTarget::Variable(arr.to_string()),
-                        value: Expression::Array(Array { elements: vec![], location: loc }),
-                        operator: AssignOp::Equal,
+                    stmts.push(Statement::Var(Var {
+                        name: arr.to_string(),
+                        value: Some(Expression::Array(Array { elements: vec![], location: loc })),
                         location: loc,
-                    })));
+                    }));
                 }
                 stmts.push(Statement::Expression(ExpressionStatement {
                     expr: Expression::FunctionCall(Box::new(FunctionCall {
@@ -4411,18 +4459,17 @@ impl Parser {
                     location: loc,
                 }));
                 stmts.extend(body);
-                stmts.push(Statement::Assignment(Box::new(Assignment {
-                    target: AssignTarget::Variable(capture_var.clone()),
-                    value: Expression::FunctionCall(Box::new(FunctionCall {
+                stmts.push(Statement::Var(Var {
+                    name: capture_var.clone(),
+                    value: Some(Expression::FunctionCall(Box::new(FunctionCall {
                         name: Box::new(Expression::Identifier(Identifier {
                             name: "__cfsavecontent_end".to_string(), location: loc,
                         })),
                         arguments: vec![],
                         location: loc,
-                    })),
-                    operator: AssignOp::Equal,
+                    }))),
                     location: loc,
-                })));
+                }));
                 // Build {attrs..., body: __cfmail_body_capture}
                 let mut pairs: Vec<(Expression, Expression)> = attrs.iter().map(|(k, v)| (
                     Expression::Literal(Literal {

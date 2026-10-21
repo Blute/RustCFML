@@ -1,0 +1,7 @@
+{
+  "server": {
+    "headerReadTimeout": 1,
+    "bodyReadTimeout": 1,
+    "maxConcurrentRequests": 1
+  }
+}

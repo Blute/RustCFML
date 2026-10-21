@@ -4298,6 +4298,10 @@ impl CfmlCompiler {
         for i in 0..4 {
             open_args.push(read_opts.get(i).cloned().unwrap_or_else(null_lit));
         }
+        // Frame-local, not `variables` (GH #493): concurrent loops on a shared
+        // component instance would otherwise share one handle.
+        instructions.push(BytecodeOp::DeclareLocal(Name::from(&handle)));
+        instructions.push(BytecodeOp::DeclareLocal(Name::from(&line)));
         self.compile_statement(
             &assign(ident(&handle), call("__cfloop_file_open", open_args)),
             instructions,
@@ -4732,6 +4736,12 @@ impl CfmlCompiler {
         // Evaluate switch expression and store
         self.compile_expression(&switch_stmt.expression, instructions);
         let switch_var = format!("__switch_{}", instructions.len());
+        // DeclareLocal first, as the for-in temporaries do (GH #493): an
+        // undeclared unscoped store in a method cascades to the component's
+        // `variables` scope, so every concurrent call on a shared instance
+        // read and wrote ONE `__switch_N` and dispatched on another call's
+        // value.
+        instructions.push(BytecodeOp::DeclareLocal(Name::from(&switch_var)));
         instructions.push(BytecodeOp::StoreLocal(Name::from(&switch_var)));
 
         self.loop_stack.push((
