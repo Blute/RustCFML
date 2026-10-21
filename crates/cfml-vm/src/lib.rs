@@ -248,6 +248,16 @@ const MIN_SESSION_TIMEOUT_SECS: u64 = 60;
 /// `is_request_timeout_error`.
 const REQUEST_TIMEOUT_ERROR_TYPE: &str = "requesttimeout";
 
+/// Deepest chain of nested `include`s a request may run. A template that
+/// includes itself (directly or via a loop of templates) would otherwise
+/// recurse until the native stack is gone: the UDF call-depth ceiling never
+/// sees an include, which runs the template's `__main__` without a CFML call
+/// frame. Lucee has no numeric cap — it throws a `StackOverflowError` — so
+/// this is the catchable equivalent; 200 is an order of magnitude above any
+/// real framework's layout → view → partial nesting. The native-stack guard
+/// still backs it for a build whose include frames are too big for 200.
+const MAX_INCLUDE_DEPTH: u32 = 200;
+
 /// `CfmlValue::Custom` tag marking the `--max-memory` hard-tier abort: this
 /// request was the largest allocator when the process crossed its memory
 /// ceiling. Uncatchable for the same reason as the timeout above — a framework's
@@ -2612,6 +2622,17 @@ pub struct CfmlVirtualMachine {
     /// `(dotted name, source file)` of the child whose `extends=` parent the
     /// next `resolve_component_template_impl` call resolves; taken at its entry.
     pending_extends_anchor: Option<(String, String)>,
+    /// `(source file, dotted name)` of every component whose `extends=` parent
+    /// is being resolved right now, outermost first. A component whose file is
+    /// already on it is its own ancestor (`extends="Self"`, or A ↔ B): the
+    /// resolver refuses it rather than recursing until the native stack is
+    /// gone — `resolve_inheritance_chain`'s `visited` set runs too late, after
+    /// the template resolution that already recursed.
+    extends_resolution_stack: Vec<(Arc<str>, String)>,
+    /// Set when `resolve_component_template_impl` returned `None` because of a
+    /// circular `extends`, so every enclosing resolution unwinds instead of
+    /// building the child without its parent. Reset at each resolution's entry.
+    extends_cycle_detected: bool,
     /// `this.*` DATA members written by a `super.method(...)` call made during a
     /// component pseudo-constructor whose body had NOT yet materialized a `this`
     /// (e.g. Preside's `Application.cfc` doing only `super.setupApplication(...)`,
@@ -2822,6 +2843,9 @@ pub struct CfmlVirtualMachine {
     /// include merge-back writes it into the instance's `this` and `variables`
     /// (GH #481 follow-up).
     method_include_depth: u32,
+    /// Depth of `include`s currently running, every kind counted. Bounded by
+    /// `MAX_INCLUDE_DEPTH` so a self-including template is a CFML error.
+    include_depth: u32,
     /// The calling frame's `__variables` scope, captured at each `CallMethod`
     /// dispatch. Used as a FALLBACK when a `this.method()` receiver carries no
     /// `__variables` of its own — which happens while a component is still
@@ -4955,6 +4979,8 @@ impl CfmlVirtualMachine {
             pending_pseudo_ctor_own_table: None,
             pending_instance_frame: None,
             pending_extends_anchor: None,
+            extends_resolution_stack: Vec::new(),
+            extends_cycle_detected: false,
             pseudo_ctor_super_this_writes: None,
             method_variables_writeback: None,
             closure_parent_writeback: None,
@@ -4998,6 +5024,7 @@ impl CfmlVirtualMachine {
             include_share_local_keys: None,
             cfc_body_include_depth: 0,
             method_include_depth: 0,
+            include_depth: 0,
             dispatch_caller_variables: None,
             dispatch_caller_this: None,
             transaction_conn: None,
@@ -7834,6 +7861,26 @@ impl CfmlVirtualMachine {
         Err(err)
     }
 
+    /// Refuse an `include` that would nest deeper than `MAX_INCLUDE_DEPTH`, or
+    /// that the thread's native stack can no longer hold (a self-including
+    /// template reaches one or the other; either way the request gets a
+    /// catchable error instead of the process aborting).
+    fn check_include_depth(&self, template: &str) -> Result<(), CfmlError> {
+        if self.include_depth >= MAX_INCLUDE_DEPTH {
+            return Err(self.wrap_error(CfmlError::runtime(format!(
+                "include nesting too deep: template [{}] is nested {} levels of include deep (limit {})",
+                template, self.include_depth, MAX_INCLUDE_DEPTH
+            ))));
+        }
+        if !cfml_common::stack_guard::has_headroom(cfml_common::stack_guard::CALL_RED_ZONE) {
+            return Err(self.wrap_error(CfmlError::runtime(format!(
+                "include nesting too deep: the native stack is exhausted including [{}] at include depth {}",
+                template, self.include_depth
+            ))));
+        }
+        Ok(())
+    }
+
     fn wrap_error(&self, mut err: CfmlError) -> CfmlError {
         // Fire the observability `error` hook (debug footer Exceptions section)
         // exactly once per exception: only on the FIRST wrap, detected by an
@@ -9236,11 +9283,14 @@ impl CfmlVirtualMachine {
         // Guard against runaway recursion — checked before allocating locals
         // to avoid blowing the native Rust stack.
         //
-        // Strategy:
-        //  1. Hard ceiling at 2500 (matches CFML engine defaults)
-        //  2. Early infinite-recursion detection: once depth > 64, check if
-        //     the last 32 frames show a repeating cycle (covers both direct
-        //     self-recursion and mutual recursion like A→B→A→B)
+        // Two guards: a hard ceiling at 2500 frames (matches CFML engine
+        // defaults) and the native-stack headroom check below it. There used
+        // to be a third — a "likely infinite recursion" heuristic that fired
+        // on the FIRST repeating call pattern once depth passed 64 — but it
+        // could not tell `f(n-1)` from `f(n)`: a legitimate 300-deep
+        // `f(n){ return 1 + f(n-1); }` was refused at depth 256 while Lucee
+        // runs it thousands deep. Runaway recursion needs no pattern match to
+        // be caught: it reaches one of the two real limits either way.
         let depth = self.call_stack.len();
         if depth > 2500 {
             return Err(self.wrap_error(CfmlError::runtime(format!(
@@ -9260,35 +9310,6 @@ impl CfmlVirtualMachine {
                 depth
             ))));
         }
-        if depth > 64 && depth % 256 == 0 {
-            // Throttled cycle detection: only check every 256 calls to avoid
-            // scanning function names on every call in deep recursion.
-            let window = 32.min(depth);
-            let recent: Vec<&str> = self.call_stack[depth - window..]
-                .iter()
-                .map(|f| &*f.function_name)
-                .collect();
-            'cycle: for cycle_len in 1..=4 {
-                if window < cycle_len * 4 {
-                    continue;
-                }
-                let pattern = &recent[recent.len() - cycle_len..];
-                let check_count = window / cycle_len;
-                for i in 0..check_count {
-                    let offset = recent.len() - cycle_len * (i + 1);
-                    let chunk = &recent[offset..offset + cycle_len];
-                    if chunk != pattern {
-                        continue 'cycle;
-                    }
-                }
-                let cycle_desc = pattern.join(" -> ");
-                return Err(self.wrap_error(CfmlError::runtime(format!(
-                    "Likely infinite recursion detected: {} (depth {})",
-                    cycle_desc, depth
-                ))));
-            }
-        }
-
         // v0.442 (call-dispatch Lever 4) — pre-size the per-call maps/sets to
         // what we already know we'll insert (inherited parent keys + declared
         // params + the `arguments` key), so the parent-copy and param-binding
@@ -16146,6 +16167,7 @@ impl CfmlVirtualMachine {
                         resolved
                     };
 
+                    self.check_include_depth(&resolved)?;
                     // Read, parse, compile, and execute the included file
                     match self.compile_file_cached_req(&resolved) {
                         Ok(sub_program) => {
@@ -16211,11 +16233,13 @@ impl CfmlVirtualMachine {
                             if declares_instance_methods {
                                 self.method_include_depth += 1;
                             }
+                            self.include_depth += 1;
                             let result = self.execute_function_with_args(
                                 &inc_func,
                                 Vec::new(),
                                 Some(&locals),
                             );
+                            self.include_depth -= 1;
                             if declares_methods {
                                 self.cfc_body_include_depth -= 1;
                             }
@@ -16353,6 +16377,7 @@ impl CfmlVirtualMachine {
                         resolved
                     };
 
+                    self.check_include_depth(&resolved)?;
                     match self.compile_file_cached_req(&resolved) {
                         Ok(sub_program) => {
                             let old_program = self.push_program_swap(sub_program);
@@ -16408,11 +16433,13 @@ impl CfmlVirtualMachine {
                             if declares_instance_methods {
                                 self.method_include_depth += 1;
                             }
+                            self.include_depth += 1;
                             let result = self.execute_function_with_args(
                                 &inc_func,
                                 Vec::new(),
                                 Some(&locals),
                             );
+                            self.include_depth -= 1;
                             if declares_methods {
                                 self.cfc_body_include_depth -= 1;
                             }
@@ -19207,6 +19234,13 @@ impl CfmlVirtualMachine {
                             let second = std::mem::replace(&mut args[1], CfmlValue::Null);
                             match second {
                                 CfmlValue::Int(n) => {
+                                    // A negative count is an error and one past
+                                    // the growth cap is refused (`queryAddRow(q,
+                                    // 4000000000)` pushed until killed).
+                                    let n = cfml_common::container_size::query_add_row_count(
+                                        n,
+                                        q.row_count(),
+                                    )?;
                                     for _ in 0..n {
                                         q.add_row(ValueMap::default());
                                     }
@@ -26621,13 +26655,13 @@ impl CfmlVirtualMachine {
                     == Some("java.io.file") =>
             {
                 let path = s.get("__path").map(|v| v.as_string()).unwrap_or_default();
-                let bytes = std::fs::read(&path).unwrap_or_default();
+                let bytes = cfml_common::vfs::read_regular_file(&path).unwrap_or_default();
                 (CfmlValue::string(path), bytes)
             }
             CfmlValue::Binary(b) => (CfmlValue::Binary(b.clone()), b.to_vec()),
             other => {
                 let path = other.as_string();
-                let bytes = std::fs::read(&path).unwrap_or_default();
+                let bytes = cfml_common::vfs::read_regular_file(&path).unwrap_or_default();
                 (CfmlValue::string(path), bytes)
             }
         };
@@ -30744,12 +30778,22 @@ impl CfmlVirtualMachine {
                     // Comparing string forms made every query equal to every
                     // other one, so the first query in the array always matched
                     // (GH #473).
-                    let eq = |x: &CfmlValue| cfml_common::equality::deep_equal(x, &target, false);
-                    let found = if method_lower == "lastindexof" {
-                        items.iter().rposition(eq)
+                    let mut found = None;
+                    if method_lower == "lastindexof" {
+                        for (i, x) in items.iter().enumerate().rev() {
+                            if cfml_common::equality::deep_equal(x, &target, false)? {
+                                found = Some(i);
+                                break;
+                            }
+                        }
                     } else {
-                        items.iter().position(eq)
-                    };
+                        for (i, x) in items.iter().enumerate() {
+                            if cfml_common::equality::deep_equal(x, &target, false)? {
+                                found = Some(i);
+                                break;
+                            }
+                        }
+                    }
                     return Ok(CfmlValue::Int(
                         found.map(|i| i as i64).unwrap_or(-1),
                     ));
@@ -31508,7 +31552,7 @@ impl CfmlVirtualMachine {
                     let other = extra_args.first().cloned().unwrap_or(CfmlValue::Null);
                     return Ok(CfmlValue::Bool(cfml_common::equality::deep_equal(
                         &object, &other, false,
-                    )));
+                    )?));
                 }
                 "deleterow" => Some("queryDeleteRow"),
                 "deletecolumn" => Some("queryDeleteColumn"),
@@ -32516,7 +32560,7 @@ impl CfmlVirtualMachine {
             match method_lower {
                 "equals" => {
                     let other = extra_args.first().cloned().unwrap_or(CfmlValue::Null);
-                    return Ok(CfmlValue::Bool(java_shims::java_equals(&object, &other)));
+                    return Ok(CfmlValue::Bool(java_shims::java_equals(&object, &other)?));
                 }
                 "hashcode" => {
                     return Ok(CfmlValue::Int(java_shims::java_hash_code(&object) as i64));
@@ -37306,6 +37350,7 @@ impl CfmlVirtualMachine {
         // Reset any stashed compile error so a `None` return reflects THIS
         // resolution (a parse error in the target file, or a genuine not-found).
         self.last_component_compile_error = None;
+        self.extends_cycle_detected = false;
         // A leading dot on a dotted component path (".preside.system.handlers.Tasks")
         // arises when a leading-slash mapping path is dot-encoded, e.g. Preside's
         // TaskManagerConfigurationWrapper does `Replace( "/preside/system/handlers/
@@ -37567,6 +37612,32 @@ impl CfmlVirtualMachine {
                 self.last_component_compile_error = Some(e.clone());
             }
         }
+        // This file is an ancestor of itself: it is already being resolved as
+        // somebody's `extends=` parent further up this very call chain. Lucee
+        // rejects the definition; without this the parent pre-resolution below
+        // re-entered this function for every link of the loop until the native
+        // stack overflowed (an abort, not an error).
+        if let Some(pos) = self
+            .extends_resolution_stack
+            .iter()
+            .position(|(path, _)| **path == *cfc_path)
+        {
+            let chain = self.extends_resolution_stack[pos..]
+                .iter()
+                .map(|(_, name)| name.as_str())
+                .chain(std::iter::once(self.extends_resolution_stack[pos].1.as_str()))
+                .collect::<Vec<_>>()
+                .join(" extends ");
+            self.last_component_compile_error = Some(CfmlError::new(
+                format!(
+                    "circular inheritance: component [{}] extends itself ({})",
+                    self.extends_resolution_stack[pos].1, chain
+                ),
+                CfmlErrorType::Expression,
+            ));
+            self.extends_cycle_detected = true;
+            return None;
+        }
         if let Ok(sub_program) = compiled {
             // Kept for the record on a first construction (a Vec of Arcs).
             let program_for_record: Option<BytecodeProgram> =
@@ -37691,8 +37762,19 @@ impl CfmlVirtualMachine {
             let mut parent_generation: u64 = 0;
             if let Some(ref pname) = parent_name {
                 self.pending_extends_anchor = Some((dotted_name.clone(), cfc_path.to_string()));
+                self.extends_resolution_stack
+                    .push((Arc::clone(&cfc_path), dotted_name.clone()));
                 let parent_template = self.resolve_component_template(pname, locals);
+                self.extends_resolution_stack.pop();
                 self.pending_extends_anchor = None;
+                if parent_template.is_none() && self.extends_cycle_detected {
+                    // The parent is this component's own descendant (see the
+                    // stack check above). Unwind what this level set up and
+                    // report failure; the stashed error names the cycle.
+                    self.source_file = old_source_file;
+                    self.pop_program_swap(old_program);
+                    return None;
+                }
                 if let Some(parent_template) = parent_template {
                     let resolved_parent = self.resolve_inheritance(parent_template, locals).ok()?;
                     if let CfmlValue::Struct(ref ps) = resolved_parent {

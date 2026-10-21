@@ -4400,3 +4400,37 @@ panic into a CFML error.
   every app on a host, each with its own `(app, id)` session. The memcached and
   cluster stores cannot answer "does any app hold this id" and keep CF/Lucee's
   behaviour.
+
+## 120. Argument caps that Lucee does not have: 100M elements per growth, PBKDF 10M iterations / 4096 bits, 1000 decimals, no device files 🏗
+
+Found by a 762-probe crash/hang audit (2026-10-21). On Lucee each of these ends in
+a JVM `OutOfMemoryError` or a thread pinned for hours; here the call throws a
+CFML error naming the argument instead:
+
+- `arraySet`, `arrayResize`, `arrayRange`, `queryAddRow` and `a[n] = v` refuse to
+  grow a container by more than **100,000,000** elements in one call
+  (`cfml_common::container_size::MAX_GROW_PER_CALL`). `a[4000000000] = 1` used to
+  allocate 4 billion nulls; `a[9223372036854775807] = 1` panicked.
+- `generatePBKDFKey` (and the `PBEKeySpec`/`SecretKeyFactory` shims): iterations
+  ≤ **10,000,000**, key size ≤ **4096** bits; a negative value threw nothing and
+  ran 4 billion iterations.
+- `numberFormat` masks are limited to **1000** decimal places (f64 has ~1074).
+- Whole-file reads (`fileRead`, `fileReadBinary`, `include`, `cfcontent file=`,
+  image/PDF/spreadsheet readers, cfmail attachments, cfhttp file parts, the
+  `java.io`/`java.nio` shims) refuse a path that is not a regular file:
+  `fileRead("/dev/zero")` read forever.
+- Nesting: 200 nested includes, 512 nested QoQ parentheses, 20,000 operands in
+  one chained expression (`1 + 1 + …`), on top of §119's JSON/XML limits. A
+  component that `extends` itself (directly or in a cycle) throws "circular
+  inheritance" instead of overflowing the stack; comparing or `structFindKey`-ing
+  two cyclic structs terminates.
+
+Lucee parity fixed in the same pass (previously accepted arguments that now
+behave as on Lucee): `lJustify`/`rJustify`/`cJustify` throw on a length below 1
+and count characters, not bytes; `bitSHRN` is logical (`>>>`) and the `bitMask*`
+functions are 32-bit; `arrayMid(a, start)` returns the rest; `arraySplice`
+and `querySlice` follow Lucee's negative-index rules; `randRange(10, 1)` swaps;
+integer `+`, `++`, `+=`, loop steps and `incrementValue` promote to double on
+overflow instead of wrapping; an integer literal past `i64` lexes as a double
+(it was `0`); `2^3^2` is left-associative (64); self-recursion is no longer
+refused at depth 256 (the 2,500-frame ceiling and the native stack guard remain).

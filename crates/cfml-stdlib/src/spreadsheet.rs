@@ -2177,7 +2177,7 @@ pub fn fn_is_spreadsheet_file(args: Vec<CfmlValue>) -> CfmlResult {
 pub fn fn_spreadsheet_read_csv(args: Vec<CfmlValue>) -> CfmlResult {
     let path = args.first().map(|v| v.as_string()).unwrap_or_default();
     let delim = args.get(1).and_then(|v| v.as_string().chars().next()).unwrap_or(',');
-    let text = std::fs::read_to_string(&path)
+    let text = cfml_common::vfs::read_regular_file_to_string(&path)
         .map_err(|e| CfmlError::runtime(format!("Unable to read CSV [{}]: {}", path, e)))?;
     Ok(CfmlSpreadsheet::from_csv_text(&text, delim).into_value(WorkbookFormat::Xlsx))
 }

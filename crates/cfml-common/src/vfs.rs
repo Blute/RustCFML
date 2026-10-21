@@ -217,13 +217,49 @@ pub trait Vfs: Send + Sync {
 #[derive(Debug, Clone)]
 pub struct RealFs;
 
+/// Refuse to slurp anything that is not a regular file (following symlinks).
+///
+/// `std::fs::read` on a character device such as `/dev/zero` or `/dev/random`
+/// never reaches EOF, so `fileRead("/dev/zero")`, `fileReadBinary`, a
+/// `<cfinclude>` or `<cfcontent file=…>` of such a path read until the process
+/// was killed or ran out of memory. A directory already failed (EISDIR); a
+/// device, socket or FIFO is refused the same way, up front, with a message
+/// that says why. Every whole-file read of a user-supplied path goes through
+/// [`read_regular_file`] / [`read_regular_file_to_string`] (or the `RealFs`
+/// methods, which call them) so the check cannot be forgotten at one site.
+pub fn check_regular_file(path: &str) -> io::Result<()> {
+    let meta = std::fs::metadata(path)?;
+    // A directory is let through so the read itself reports the OS's own
+    // EISDIR wording, which callers and tests already match on.
+    if meta.is_file() || meta.is_dir() {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("[{}] is not a regular file", path),
+        ))
+    }
+}
+
+/// `std::fs::read` guarded by [`check_regular_file`].
+pub fn read_regular_file(path: &str) -> io::Result<Vec<u8>> {
+    check_regular_file(path)?;
+    std::fs::read(path)
+}
+
+/// `std::fs::read_to_string` guarded by [`check_regular_file`].
+pub fn read_regular_file_to_string(path: &str) -> io::Result<String> {
+    check_regular_file(path)?;
+    std::fs::read_to_string(path)
+}
+
 impl Vfs for RealFs {
     fn read_to_string(&self, path: &str) -> io::Result<String> {
-        std::fs::read_to_string(path)
+        read_regular_file_to_string(path)
     }
 
     fn read(&self, path: &str) -> io::Result<Vec<u8>> {
-        std::fs::read(path)
+        read_regular_file(path)
     }
 
     fn exists(&self, path: &str) -> bool {

@@ -718,7 +718,12 @@ impl Lexer {
         let token = if value.contains('.') || value.contains('e') || value.contains('E') {
             Token::Double(value.parse().unwrap_or(0.0))
         } else {
-            Token::Integer(value.parse().unwrap_or(0))
+            // A literal past i64 (`9223372036854775808`) is a double, as every
+            // numeric literal is on Lucee — it used to lex as 0, silently.
+            match value.parse::<i64>() {
+                Ok(i) => Token::Integer(i),
+                Err(_) => Token::Double(value.parse().unwrap_or(0.0)),
+            }
         };
 
         self.tokens.push(TokenWithLoc {

@@ -307,7 +307,7 @@ fn read_source_path(path: &str) -> CfmlResult {
     let bytes = if path.starts_with("http://") || path.starts_with("https://") {
         fetch_url(path)?
     } else {
-        std::fs::read(path)
+        cfml_common::vfs::read_regular_file(path)
             .map_err(|e| CfmlError::runtime(format!("Unable to read image [{}]: {}", path, e)))?
     };
     let (img, format) = decode_bytes(&bytes)?;
@@ -1379,7 +1379,7 @@ impl CfmlImage {
             return Some(b.clone());
         }
         if !self.source.is_empty() {
-            return std::fs::read(&self.source).ok();
+            return cfml_common::vfs::read_regular_file(&self.source).ok();
         }
         None
     }
@@ -1964,7 +1964,7 @@ pub fn fn_image_read_svg(args: Vec<CfmlValue>) -> CfmlResult {
     let data: Vec<u8> = if source.contains("<svg") || source.trim_start().starts_with("<?xml") {
         source.into_bytes()
     } else {
-        std::fs::read(&source).map_err(|e| {
+        cfml_common::vfs::read_regular_file(&source).map_err(|e| {
             CfmlError::runtime(format!("imageReadSvg: cannot read '{}': {}", source, e))
         })?
     };

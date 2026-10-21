@@ -48,6 +48,53 @@ pub const ARRAY_SLOT: usize = 24;
 /// allocator size classes make a 1-element array cost what a 4-element one does.
 pub const ARRAY_MIN_SLOTS: usize = 4;
 
+/// The most elements one call may ADD to a container (array slots, query rows,
+/// padding characters). `a[4000000000] = 1`, `arrayResize(a, 4e9)`,
+/// `queryAddRow(q, 4e9)` and `lJustify(s, 4e9)` each used to grow element by
+/// element until the process was killed or the allocator aborted — a single
+/// user-supplied index was enough. Lucee has no such cap and relies on the JVM
+/// heap limit; here the call throws a CFML error that names the index instead.
+/// 100M slots is ~2.4 GB of `CfmlValue`, already far past anything a request
+/// legitimately builds in one write.
+pub const MAX_GROW_PER_CALL: usize = 100_000_000;
+
+/// Refuse a call that would ADD more than [`MAX_GROW_PER_CALL`] elements to a
+/// container in one write. The error names the function, the argument and the
+/// size asked for. Shared by the stdlib BIFs and the VM's in-place
+/// `queryAddRow` intercept so the two paths cannot drift.
+pub fn check_grow_per_call(
+    fn_name: &str,
+    arg_name: &str,
+    target_len: i64,
+    current_len: usize,
+) -> Result<(), crate::vm::CfmlError> {
+    let grow = target_len as i128 - current_len as i128;
+    if grow > MAX_GROW_PER_CALL as i128 {
+        return Err(crate::vm::CfmlError::expression(format!(
+            "Invalid call of the function [{}], Argument [{}] is invalid, growing to [{}] \
+             elements would add [{}] in one call; the maximum is [{}]",
+            fn_name, arg_name, target_len, grow, MAX_GROW_PER_CALL
+        )));
+    }
+    Ok(())
+}
+
+/// The row count for `queryAddRow(q, n)`: a negative count is refused
+/// (`queryAddRow(q, -1)` used to cast to usize::MAX and silently add nothing)
+/// and one past [`MAX_GROW_PER_CALL`] is refused too (`queryAddRow(q,
+/// 4000000000)` pushed rows until the process was killed).
+pub fn query_add_row_count(n: i64, current_rows: usize) -> Result<usize, crate::vm::CfmlError> {
+    if n < 0 {
+        return Err(crate::vm::CfmlError::expression(format!(
+            "Invalid call of the function [queryAddRow], second Argument [number] is invalid, \
+             must be a non-negative integer; now [{}]",
+            n
+        )));
+    }
+    check_grow_per_call("queryAddRow", "number", n.saturating_add(current_rows as i64), current_rows)?;
+    Ok(n as usize)
+}
+
 /// Reporting size of a struct container holding `len` entries, excluding the
 /// entries' own keys and values.
 #[inline]

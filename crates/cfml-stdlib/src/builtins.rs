@@ -2709,16 +2709,52 @@ fn fn_encode_for_html(args: Vec<CfmlValue>) -> CfmlResult {
     Ok(CfmlValue::string(result))
 }
 
+/// The padded length for `lJustify`/`rJustify`/`cJustify`: Lucee refuses a
+/// length below 1 (`Parameter 2 of function lJustify which is now [0] must be a
+/// positive integer`). Above `MAX_GROW_PER_CALL` the call is refused too —
+/// `lJustify("a", 4000000000)` used to panic inside `format!` (its width is a
+/// u16) and `cJustify("a", -1)` cast the length to `usize::MAX` and aborted the
+/// process in `" ".repeat()`.
+fn justify_length(fn_name: &str, args: &[CfmlValue], must_be: &str) -> Result<usize, CfmlError> {
+    let length = get_int(args, 1);
+    if length < 1 {
+        return Err(CfmlError::expression(format!(
+            "Parameter 2 of function {} which is now [{}] must be {}",
+            fn_name, length, must_be
+        )));
+    }
+    if length as u64 > cfml_common::container_size::MAX_GROW_PER_CALL as u64 {
+        return Err(CfmlError::expression(format!(
+            "Parameter 2 of function {} which is now [{}] exceeds the maximum length of [{}]",
+            fn_name, length, cfml_common::container_size::MAX_GROW_PER_CALL
+        )));
+    }
+    Ok(length as usize)
+}
+
+/// `s` padded with `left` spaces before and `right` after. Built by hand rather
+/// than through `format!("{:<width$}")`, whose width is a u16: anything above
+/// 65535 panicked with "Formatting argument out of range".
+fn pad_spaces(s: &str, left: usize, right: usize) -> String {
+    let mut out = String::with_capacity(s.len() + left + right);
+    out.extend(std::iter::repeat(' ').take(left));
+    out.push_str(s);
+    out.extend(std::iter::repeat(' ').take(right));
+    out
+}
+
 fn fn_ljustify(args: Vec<CfmlValue>) -> CfmlResult {
     let s = get_str(&args, 0);
-    let length = get_int(&args, 1).max(0) as usize;
-    Ok(CfmlValue::string(format!("{:<width$}", s, width = length)))
+    let length = justify_length("lJustify", &args, "a positive integer")?;
+    let pad = length.saturating_sub(s.chars().count());
+    Ok(CfmlValue::string(pad_spaces(&s, 0, pad)))
 }
 
 fn fn_rjustify(args: Vec<CfmlValue>) -> CfmlResult {
     let s = get_str(&args, 0);
-    let length = get_int(&args, 1).max(0) as usize;
-    Ok(CfmlValue::string(format!("{:>width$}", s, width = length)))
+    let length = justify_length("rJustify", &args, "a positive integer")?;
+    let pad = length.saturating_sub(s.chars().count());
+    Ok(CfmlValue::string(pad_spaces(&s, pad, 0)))
 }
 
 fn add_thousands_separator(s: &str) -> String {
@@ -2760,6 +2796,17 @@ pub(crate) fn fn_number_format(args: Vec<CfmlValue>) -> CfmlResult {
     } else {
         0
     };
+    // `format!`'s precision is a u16: a mask with more than 65535 decimal
+    // places panicked ("Formatting argument out of range"). A double has no
+    // more than ~1074 significant decimals anyway, so refuse a mask past 1000.
+    const MAX_DECIMALS: usize = 1000;
+    if decimals > MAX_DECIMALS {
+        return Err(CfmlError::expression(format!(
+            "Invalid call of the function [numberFormat], second Argument [mask] is invalid, \
+             the mask has [{}] decimal places; the maximum is [{}]",
+            decimals, MAX_DECIMALS
+        )));
+    }
 
     let formatted_num = format!("{:.prec$}", n.abs(), prec = decimals);
     let parts: Vec<&str> = formatted_num.split('.').collect();
@@ -2862,9 +2909,18 @@ fn fn_format_base_n(args: Vec<CfmlValue>) -> CfmlResult {
 
 fn fn_input_base_n(args: Vec<CfmlValue>) -> CfmlResult {
     let s = get_str(&args, 0);
-    let radix = get_int(&args, 1) as u32;
+    let radix = get_int(&args, 1);
+    // Lucee InputBaseN: "radix must be between 2 and 36". `from_str_radix`
+    // panics outside that range, so `inputBaseN("111", 1)` took the engine down.
+    if !(2..=36).contains(&radix) {
+        return Err(CfmlError::expression(format!(
+            "Invalid call of the function [inputBaseN], second Argument [radix] is invalid, \
+             radix must be between 2 and 36; now [{}]",
+            radix
+        )));
+    }
     Ok(CfmlValue::Int(
-        i64::from_str_radix(&s, radix).unwrap_or(0),
+        i64::from_str_radix(&s, radix as u32).unwrap_or(0),
     ))
 }
 
@@ -2919,14 +2975,17 @@ fn fn_paragraph_format(args: Vec<CfmlValue>) -> CfmlResult {
 
 fn fn_cjustify(args: Vec<CfmlValue>) -> CfmlResult {
     let s = get_str(&args, 0);
-    let length = get_int(&args, 1) as usize;
-    if s.len() >= length {
+    let length = justify_length("cJustify", &args, "a non-negative integer")?;
+    // Characters, not bytes: `cJustify("é", 5)` padded to 4 characters because
+    // "é" is two bytes.
+    let chars = s.chars().count();
+    if chars >= length {
         return Ok(CfmlValue::string(s));
     }
-    let padding = length - s.len();
+    let padding = length - chars;
     let left_pad = padding / 2;
     let right_pad = padding - left_pad;
-    Ok(CfmlValue::string(format!("{}{}{}", " ".repeat(left_pad), s, " ".repeat(right_pad))))
+    Ok(CfmlValue::string(pad_spaces(&s, left_pad, right_pad)))
 }
 
 // ===============================================
@@ -3152,6 +3211,21 @@ fn fn_array_unshift(args: Vec<CfmlValue>) -> CfmlResult {
 /// A 1-based array index argument, refused the way Lucee refuses it: a
 /// non-numeric string is a cast error rather than a silent `0` (GH #430). The
 /// RANGE is checked by the caller, whose message differs per BIF.
+/// Refuse a call that would ADD more than `MAX_GROW_PER_CALL` elements to a
+/// container in one write — `arrayResize(a, 4000000000)`, `arraySet(a, 1, 4e9,
+/// 0)`, `arrayRange(1, 4e9)` and `queryAddRow(q, 4e9)` all pushed element by
+/// element until the process was killed or the allocator aborted. The error
+/// names the argument and the size asked for. See
+/// `cfml_common::container_size::MAX_GROW_PER_CALL` for the cap's rationale.
+fn check_array_growth(
+    fn_name: &str,
+    arg_name: &str,
+    target_len: i64,
+    current_len: usize,
+) -> Result<(), CfmlError> {
+    cfml_common::container_size::check_grow_per_call(fn_name, arg_name, target_len, current_len)
+}
+
 fn get_index_arg(args: &[CfmlValue], idx: usize) -> Result<i64, CfmlError> {
     match args.get(idx).map(|v| v.query_column_scalar()) {
         Some(CfmlValue::Int(i)) => Ok(*i),
@@ -3330,30 +3404,31 @@ fn array_find_positions(
     needle: &CfmlValue,
     nocase: bool,
     first_only: bool,
-) -> Vec<usize> {
+) -> Result<Vec<usize>, CfmlError> {
     let mut hits: Vec<usize> = Vec::new();
     if needle_compares_lock_free(needle) {
         arr.with_read(|items| {
             for (i, v) in items.iter().enumerate() {
-                if cfml_deep_equal(v, needle, nocase) {
+                if cfml_deep_equal(v, needle, nocase)? {
                     hits.push(i + 1);
                     if first_only {
-                        return;
+                        return Ok(());
                     }
                 }
             }
-        });
-        return hits;
+            Ok::<(), CfmlError>(())
+        })?;
+        return Ok(hits);
     }
     for (i, v) in arr.iter().enumerate() {
-        if cfml_deep_equal(&v, needle, nocase) {
+        if cfml_deep_equal(&v, needle, nocase)? {
             hits.push(i + 1);
             if first_only {
                 break;
             }
         }
     }
-    hits
+    Ok(hits)
 }
 
 fn fn_array_find(args: Vec<CfmlValue>) -> CfmlResult {
@@ -3363,7 +3438,7 @@ fn fn_array_find(args: Vec<CfmlValue>) -> CfmlResult {
     let args = binary_arg0_as_array(args);
     if args.len() >= 2 {
         if let CfmlValue::Array(arr) = &args[0] {
-            if let Some(pos) = array_find_positions(arr, &args[1], false, true).first() {
+            if let Some(pos) = array_find_positions(arr, &args[1], false, true)?.first() {
                 return Ok(CfmlValue::Int(*pos as i64));
             }
         }
@@ -3376,7 +3451,7 @@ fn fn_array_find_no_case(args: Vec<CfmlValue>) -> CfmlResult {
     let args = binary_arg0_as_array(args);
     if args.len() >= 2 {
         if let CfmlValue::Array(arr) = &args[0] {
-            if let Some(pos) = array_find_positions(arr, &args[1], true, true).first() {
+            if let Some(pos) = array_find_positions(arr, &args[1], true, true)?.first() {
                 return Ok(CfmlValue::Int(*pos as i64));
             }
         }
@@ -3466,8 +3541,13 @@ fn fn_array_slice(args: Vec<CfmlValue>) -> CfmlResult {
                         .to_string(),
                 ));
             }
-            while offset <= 0 {
-                offset += n;
+            if offset <= 0 {
+                // Lucee adds `n` until the offset is positive; the closed form
+                // avoids 2^63 iterations for an offset of i64::MIN.
+                offset = offset.rem_euclid(n);
+                if offset == 0 {
+                    offset = n;
+                }
             }
             if n < offset {
                 return Err(CfmlError::expression(
@@ -3608,8 +3688,21 @@ fn fn_array_set(args: Vec<CfmlValue>) -> CfmlResult {
                     start_pos
                 )));
             }
+            let end_pos = get_index_arg(&args, 2)?;
+            // Lucee: "End index of the function arraySet must be greater than
+            // the Start index; now [start:3, end:1]" (it accepts equal).
+            if start_pos > end_pos {
+                return Err(CfmlError::expression(format!(
+                    "End index of the function arraySet must be greater than the Start index; \
+                     now [start:{}, end:{}]",
+                    start_pos, end_pos
+                )));
+            }
             let start = start_pos as usize - 1;
-            let end = get_index_arg(&args, 2)?.max(0) as usize;
+            let end = end_pos as usize;
+            // `arraySet(a, 1, 4000000000, 0)` pushed 4e9 nulls one by one
+            // until the process was killed.
+            check_array_growth("arraySet", "endIndex", end_pos, arr.len())?;
             arr.with_write(|v| {
                 while v.len() < end {
                     v.push(CfmlValue::Null);
@@ -3792,7 +3885,7 @@ fn fn_array_find_all(args: Vec<CfmlValue>) -> CfmlResult {
     let args = binary_arg0_as_array(args);
     if args.len() >= 2 {
         if let CfmlValue::Array(arr) = &args[0] {
-            let indices: Vec<CfmlValue> = array_find_positions(arr, &args[1], false, false)
+            let indices: Vec<CfmlValue> = array_find_positions(arr, &args[1], false, false)?
                 .into_iter()
                 .map(|i| CfmlValue::Int(i as i64))
                 .collect();
@@ -3807,7 +3900,7 @@ fn fn_array_find_all_no_case(args: Vec<CfmlValue>) -> CfmlResult {
     let args = binary_arg0_as_array(args);
     if args.len() >= 2 {
         if let CfmlValue::Array(arr) = &args[0] {
-            let indices: Vec<CfmlValue> = array_find_positions(arr, &args[1], true, false)
+            let indices: Vec<CfmlValue> = array_find_positions(arr, &args[1], true, false)?
                 .into_iter()
                 .map(|i| CfmlValue::Int(i as i64))
                 .collect();
@@ -4268,11 +4361,44 @@ fn fn_struct_find_key(args: Vec<CfmlValue>) -> CfmlResult {
             let key = get_str(&args, 1);
             let scope = if args.len() >= 3 { get_str(&args, 2).to_lowercase() } else { "one".to_string() };
             let mut results = Vec::new();
-            struct_find_key_recursive(s, &key, "", &scope, &mut results);
+            let mut visited = StructWalkVisited::default();
+            struct_find_key_recursive(s, &key, "", &scope, &mut results, &mut visited)?;
             return Ok(CfmlValue::array(results));
         }
     }
     Ok(CfmlValue::array(Vec::new()))
+}
+
+/// Containers on the CURRENT path of a `structFindKey`/`structFindValue`
+/// walk, by backing pointer. A container that is its own ancestor
+/// (`a.self = a`, or a struct holding an array holding it) is not entered
+/// again: Lucee returns from such a graph without looping, while this walk
+/// recursed around the cycle until the native stack overflowed — an abort of
+/// the whole process. Only the path is tracked, not everything ever seen, so
+/// a struct shared by two keys is still reported under both paths.
+#[derive(Default)]
+struct StructWalkVisited(std::collections::HashSet<usize>);
+
+impl StructWalkVisited {
+    /// `Ok(true)` when the container at `ptr` is not already on the path and
+    /// the native stack has room to descend into it (pair with `leave`);
+    /// `Ok(false)` for a cycle; `Err` when the stack is nearly exhausted.
+    fn enter(&mut self, ptr: usize) -> Result<bool, CfmlError> {
+        if !self.0.insert(ptr) {
+            return Ok(false);
+        }
+        if !cfml_common::stack_guard::has_headroom(cfml_common::stack_guard::WALK_RED_ZONE) {
+            return Err(CfmlError::runtime(
+                "Cannot search the struct: it is nested too deeply (the native stack is exhausted)"
+                    .to_string(),
+            ));
+        }
+        Ok(true)
+    }
+
+    fn leave(&mut self, ptr: usize) {
+        self.0.remove(&ptr);
+    }
 }
 
 fn struct_find_key_recursive(
@@ -4281,7 +4407,25 @@ fn struct_find_key_recursive(
     path: &str,
     scope: &str,
     results: &mut Vec<CfmlValue>,
-) {
+    visited: &mut StructWalkVisited,
+) -> Result<(), CfmlError> {
+    let ptr = s.backing_ptr();
+    if !visited.enter(ptr)? {
+        return Ok(());
+    }
+    let r = struct_find_key_recursive_inner(s, search_key, path, scope, results, visited);
+    visited.leave(ptr);
+    r
+}
+
+fn struct_find_key_recursive_inner(
+    s: &CfmlStruct,
+    search_key: &str,
+    path: &str,
+    scope: &str,
+    results: &mut Vec<CfmlValue>,
+    visited: &mut StructWalkVisited,
+) -> Result<(), CfmlError> {
     let search_lower = search_key.to_lowercase();
     for (k, v) in s.iter() {
         let current_path =
@@ -4292,22 +4436,31 @@ fn struct_find_key_recursive(
             result_struct.insert("path".to_string(), CfmlValue::string(current_path.clone()));
             result_struct.insert("value".to_string(), v.clone());
             results.push(CfmlValue::strukt(result_struct));
-            if scope == "one" { return; }
+            if scope == "one" { return Ok(()); }
         }
         if let CfmlValue::Struct(nested) = &v {
-            struct_find_key_recursive(nested, search_key, &current_path, scope, results);
-            if scope == "one" && !results.is_empty() { return; }
+            struct_find_key_recursive(nested, search_key, &current_path, scope, results, visited)?;
+            if scope == "one" && !results.is_empty() { return Ok(()); }
         }
         if let CfmlValue::Array(arr) = &v {
+            let arr_ptr = arr.backing_ptr();
+            if !visited.enter(arr_ptr)? {
+                continue;
+            }
             for (i, item) in arr.iter().enumerate() {
                 if let CfmlValue::Struct(nested) = &item {
                     let arr_path = format!("{}[{}]", current_path, i + 1);
-                    struct_find_key_recursive(nested, search_key, &arr_path, scope, results);
-                    if scope == "one" && !results.is_empty() { return; }
+                    let r = struct_find_key_recursive(nested, search_key, &arr_path, scope, results, visited);
+                    if r.is_err() || (scope == "one" && !results.is_empty()) {
+                        visited.leave(arr_ptr);
+                        return r;
+                    }
                 }
             }
+            visited.leave(arr_ptr);
         }
     }
+    Ok(())
 }
 
 fn fn_struct_find_value(args: Vec<CfmlValue>) -> CfmlResult {
@@ -4317,7 +4470,8 @@ fn fn_struct_find_value(args: Vec<CfmlValue>) -> CfmlResult {
             let search_value = get_str(&args, 1);
             let scope = if args.len() >= 3 { get_str(&args, 2).to_lowercase() } else { "one".to_string() };
             let mut results = Vec::new();
-            struct_find_value_recursive(s, &search_value, "", &scope, &mut results);
+            let mut visited = StructWalkVisited::default();
+            struct_find_value_recursive(s, &search_value, "", &scope, &mut results, &mut visited)?;
             return Ok(CfmlValue::array(results));
         }
     }
@@ -4330,7 +4484,25 @@ fn struct_find_value_recursive(
     path: &str,
     scope: &str,
     results: &mut Vec<CfmlValue>,
-) {
+    visited: &mut StructWalkVisited,
+) -> Result<(), CfmlError> {
+    let ptr = s.backing_ptr();
+    if !visited.enter(ptr)? {
+        return Ok(());
+    }
+    let r = struct_find_value_recursive_inner(s, search_value, path, scope, results, visited);
+    visited.leave(ptr);
+    r
+}
+
+fn struct_find_value_recursive_inner(
+    s: &CfmlStruct,
+    search_value: &str,
+    path: &str,
+    scope: &str,
+    results: &mut Vec<CfmlValue>,
+    visited: &mut StructWalkVisited,
+) -> Result<(), CfmlError> {
     let search_lower = search_value.to_lowercase();
     for (k, v) in s.iter() {
         let current_path =
@@ -4341,22 +4513,31 @@ fn struct_find_value_recursive(
             result_struct.insert("path".to_string(), CfmlValue::string(current_path.clone()));
             result_struct.insert("key".to_string(), CfmlValue::string(k.clone()));
             results.push(CfmlValue::strukt(result_struct));
-            if scope == "one" { return; }
+            if scope == "one" { return Ok(()); }
         }
         if let CfmlValue::Struct(nested) = &v {
-            struct_find_value_recursive(nested, search_value, &current_path, scope, results);
-            if scope == "one" && !results.is_empty() { return; }
+            struct_find_value_recursive(nested, search_value, &current_path, scope, results, visited)?;
+            if scope == "one" && !results.is_empty() { return Ok(()); }
         }
         if let CfmlValue::Array(arr) = &v {
+            let arr_ptr = arr.backing_ptr();
+            if !visited.enter(arr_ptr)? {
+                continue;
+            }
             for (i, item) in arr.iter().enumerate() {
                 if let CfmlValue::Struct(nested) = &item {
                     let arr_path = format!("{}[{}]", current_path, i + 1);
-                    struct_find_value_recursive(nested, search_value, &arr_path, scope, results);
-                    if scope == "one" && !results.is_empty() { return; }
+                    let r = struct_find_value_recursive(nested, search_value, &arr_path, scope, results, visited);
+                    if r.is_err() || (scope == "one" && !results.is_empty()) {
+                        visited.leave(arr_ptr);
+                        return r;
+                    }
                 }
             }
+            visited.leave(arr_ptr);
         }
     }
+    Ok(())
 }
 
 fn fn_struct_clear(args: Vec<CfmlValue>) -> CfmlResult {
@@ -5054,7 +5235,7 @@ fn fn_is_image_file(args: Vec<CfmlValue>) -> CfmlResult {
     if path.is_empty() {
         return Ok(CfmlValue::Bool(false));
     }
-    let bytes = match std::fs::read(&path) {
+    let bytes = match cfml_common::vfs::read_regular_file(&path) {
         Ok(b) => b,
         Err(_) => return Ok(CfmlValue::Bool(false)),
     };
@@ -5821,10 +6002,28 @@ fn fn_rand(args: Vec<CfmlValue>) -> CfmlResult {
 
 fn fn_rand_range(args: Vec<CfmlValue>) -> CfmlResult {
     let alg = rand_algorithm("RandRange", &args, 2)?;
-    let min = get_int(&args, 0);
-    let max = get_int(&args, 1);
-    let range = (max - min + 1) as f64;
-    let result = min + (random_unit(alg) * range).floor() as i64;
+    let mut min = get_int(&args, 0);
+    let mut max = get_int(&args, 1);
+    // Lucee swaps a reversed range rather than producing garbage.
+    if min > max {
+        std::mem::swap(&mut min, &mut max);
+    }
+    // `max - min + 1` overflowed for a span wider than 64 bits
+    // (`randRange(-9223372036854775808, 9223372036854775807)`): a debug panic,
+    // a wrapped (wrong) span in release. Lucee computes in 32-bit ints and such
+    // a call is meaningless there too; refuse it rather than invent a number.
+    let span = max
+        .checked_sub(min)
+        .and_then(|d| d.checked_add(1))
+        .ok_or_else(|| {
+            CfmlError::expression(format!(
+                "Invalid call of the function [randRange], the range [{}..{}] is too wide \
+                 for a 64-bit integer",
+                min, max
+            ))
+        })?;
+    // Saturating: the f64 product can round up to 2^63 for a span near i64::MAX.
+    let result = min.saturating_add((random_unit(alg) * span as f64).floor() as i64);
     Ok(CfmlValue::Int(result.min(max)))
 }
 
@@ -5979,35 +6178,92 @@ fn fn_bit_not(args: Vec<CfmlValue>) -> CfmlResult {
     Ok(CfmlValue::Int((!n) as i64))
 }
 
+/// The shift count for `bitSHLN`/`bitSHRN`. Lucee (BitSHLN.java) refuses a
+/// negative count — "Invalid shift value [-1], value must be a positive
+/// integer" — and shifts a Java `long`, so a count of 64 or more is masked to
+/// 0..63 exactly as the JVM masks it (`bitSHLN(1, 64)` is 1). A raw `<<`
+/// panicked on both cases in a debug build and wrapped in release.
+fn bit_shift_count(fn_name: &str, args: &[CfmlValue]) -> Result<u32, CfmlError> {
+    let count = get_int(args, 1);
+    if count < 0 {
+        return Err(CfmlError::expression(format!(
+            "Invalid call of the function [{}], second Argument [count] is invalid, \
+             Invalid shift value [{}], value must be a positive integer",
+            fn_name, count
+        )));
+    }
+    Ok((count & 63) as u32)
+}
+
 fn fn_bit_shln(args: Vec<CfmlValue>) -> CfmlResult {
-    Ok(CfmlValue::Int(get_int(&args, 0) << get_int(&args, 1)))
+    let count = bit_shift_count("bitSHLN", &args)?;
+    Ok(CfmlValue::Int(get_int(&args, 0).wrapping_shl(count)))
 }
 
 fn fn_bit_shrn(args: Vec<CfmlValue>) -> CfmlResult {
-    Ok(CfmlValue::Int(get_int(&args, 0) >> get_int(&args, 1)))
+    // Lucee uses `>>>`: a LOGICAL shift, so `bitSHRN(-1, 1)` is
+    // 9223372036854775807, not -1.
+    let count = bit_shift_count("bitSHRN", &args)?;
+    Ok(CfmlValue::Int(((get_int(&args, 0) as u64) >> count) as i64))
+}
+
+/// The `(number, start, length)` triple of the `bitMask*` functions, as the
+/// 32-bit `int`s Lucee computes with (BitMaskRead.java and friends): the
+/// number must fit an int ("value [n] must be an integer.") and `start` and
+/// `length` must each be 0..=31 ("must be between 0 and 31, now n"). `1 << 99`
+/// panicked in a debug build and wrapped in release.
+fn bit_mask_args(
+    fn_name: &str,
+    args: &[CfmlValue],
+    start_idx: usize,
+) -> Result<(i32, u32, u32), CfmlError> {
+    let number = get_int(args, 0);
+    let number = i32::try_from(number).map_err(|_| {
+        CfmlError::expression(format!(
+            "Invalid call of the function [{}], first Argument [number] is invalid, \
+             value [{}] must be an integer.",
+            fn_name, number
+        ))
+    })?;
+    let bits = |idx: usize, which: &str, name: &str| -> Result<u32, CfmlError> {
+        let v = get_int(args, idx);
+        if !(0..=31).contains(&v) {
+            return Err(CfmlError::expression(format!(
+                "Invalid call of the function [{}], {} Argument [{}] is invalid, \
+                 must be between 0 and 31, now {}",
+                fn_name, which, name, v
+            )));
+        }
+        Ok(v as u32)
+    };
+    let (start_which, length_which) = if start_idx == 1 { ("second", "third") } else { ("third", "fourth") };
+    let start = bits(start_idx, start_which, "start")?;
+    let length = bits(start_idx + 1, length_which, "length")?;
+    Ok((number, start, length))
+}
+
+/// `(1 << length) - 1` in Java int arithmetic (`length` 0..=31; 31 wraps to
+/// `Integer.MAX_VALUE` the way it does on the JVM).
+fn low_bits_mask(length: u32) -> i32 {
+    1i32.wrapping_shl(length).wrapping_sub(1)
 }
 
 fn fn_bit_mask_read(args: Vec<CfmlValue>) -> CfmlResult {
-    let number = get_int(&args, 0);
-    let start = get_int(&args, 1);
-    let length = get_int(&args, 2);
-    Ok(CfmlValue::Int((number >> start) & ((1 << length) - 1)))
+    let (number, start, length) = bit_mask_args("bitMaskRead", &args, 1)?;
+    Ok(CfmlValue::Int(((number >> start) & low_bits_mask(length)) as i64))
 }
 
 fn fn_bit_mask_set(args: Vec<CfmlValue>) -> CfmlResult {
-    let number = get_int(&args, 0);
-    let mask = get_int(&args, 1);
-    let start = get_int(&args, 2);
-    let length = get_int(&args, 3);
-    let clear_mask = ((1i64 << length) - 1) << start;
-    Ok(CfmlValue::Int((number & !clear_mask) | ((mask & ((1 << length) - 1)) << start)))
+    let (number, start, length) = bit_mask_args("bitMaskSet", &args, 2)?;
+    let mask = get_int(&args, 1) as i32;
+    let clear_mask = low_bits_mask(length).wrapping_shl(start);
+    let bits = (mask & low_bits_mask(length)).wrapping_shl(start);
+    Ok(CfmlValue::Int(((number & !clear_mask) | bits) as i64))
 }
 
 fn fn_bit_mask_clear(args: Vec<CfmlValue>) -> CfmlResult {
-    let number = get_int(&args, 0);
-    let start = get_int(&args, 1);
-    let length = get_int(&args, 2);
-    Ok(CfmlValue::Int(number & !(((1i64 << length) - 1) << start)))
+    let (number, start, length) = bit_mask_args("bitMaskClear", &args, 1)?;
+    Ok(CfmlValue::Int((number & !low_bits_mask(length).wrapping_shl(start)) as i64))
 }
 
 // ===============================================
@@ -7689,7 +7945,7 @@ fn fn_query_add_row(args: Vec<CfmlValue>) -> CfmlResult {
     if let Some(CfmlValue::Query(q)) = args.first() {
         let num_rows = if args.len() >= 2 {
             match &args[1] {
-                CfmlValue::Int(n) => *n as usize,
+                CfmlValue::Int(n) => cfml_common::container_size::query_add_row_count(*n, q.row_count())?,
                 CfmlValue::Struct(data) => {
                     q.add_row(data.snapshot());
                     return Ok(CfmlValue::Query(q.clone()));
@@ -8758,7 +9014,7 @@ fn fn_get_profile_string(args: Vec<CfmlValue>) -> CfmlResult {
     let section = get_str(&args, 1);
     let entry = get_str(&args, 2);
 
-    let content = std::fs::read_to_string(&path).map_err(|e| {
+    let content = cfml_common::vfs::read_regular_file_to_string(&path).map_err(|e| {
         CfmlError::runtime(format!("getProfileString: cannot read '{}': {}", path, e))
     })?;
 
@@ -8788,7 +9044,7 @@ fn fn_set_profile_string(args: Vec<CfmlValue>) -> CfmlResult {
     let entry = get_str(&args, 2);
     let value = get_str(&args, 3);
 
-    let content = std::fs::read_to_string(&path).unwrap_or_default();
+    let content = cfml_common::vfs::read_regular_file_to_string(&path).unwrap_or_default();
     let (section_order, mut sections) = parse_ini_file(&content);
 
     // Find or create section (case-insensitive match)
@@ -8857,7 +9113,7 @@ fn fn_get_profile_sections(args: Vec<CfmlValue>) -> CfmlResult {
     }
     let path = get_str(&args, 0);
 
-    let content = std::fs::read_to_string(&path).map_err(|e| {
+    let content = cfml_common::vfs::read_regular_file_to_string(&path).map_err(|e| {
         CfmlError::runtime(format!("getProfileSections: cannot read '{}': {}", path, e))
     })?;
 
@@ -8940,7 +9196,8 @@ fn fn_file_read(args: Vec<CfmlValue>) -> CfmlResult {
     // charset)` / `<cffile action="read" charset=…>`). It used to be ignored, so
     // a UTF-16 file came back as mojibake.
     let cs = charset_arg(&args, 1, "read", &path)?;
-    match std::fs::read(&path) {
+    // Regular files only: `fileRead("/dev/zero")` read until the process died.
+    match cfml_common::vfs::read_regular_file(&path) {
         Ok(bytes) => Ok(CfmlValue::string(cfml_common::charset::decode_vec(bytes, cs))),
         // Lucee surfaces a missing file from fileRead() as an `expression` error
         // (only fileReadBinary uses FileNotFoundException) — match that asymmetry.
@@ -10213,7 +10470,7 @@ fn fn_cfhttp(args: Vec<CfmlValue>) -> CfmlResult {
                                     let file_bytes = match inline {
                                         Some(CfmlValue::Binary(b)) => b.to_vec(),
                                         Some(other) => other.as_string().into_bytes(),
-                                        None => match std::fs::read(&file_path) {
+                                        None => match cfml_common::vfs::read_regular_file(&file_path) {
                                             Ok(b) => b,
                                             Err(e) => return Err(CfmlError::runtime(format!(
                                                 "cfhttp: failed to read file '{}' for multipart upload: {}", file_path, e
@@ -18574,7 +18831,9 @@ fn fn_array_resize(args: Vec<CfmlValue>) -> CfmlResult {
             // hang (`arrayResize(a,-1)`) reachable from user input. Lucee
             // accepts it as a no-op. A size at or below the current length is
             // also a no-op there (arrayResize only grows).
-            let size = get_index_arg(&args, 1)?.max(0) as usize;
+            let requested = get_index_arg(&args, 1)?;
+            check_array_growth("arrayResize", "size", requested, arr.len())?;
+            let size = requested.max(0) as usize;
             // In-place grow on the shared handle.
             arr.with_write(|v| {
                 while v.len() < size {
@@ -18625,13 +18884,36 @@ fn fn_array_mid(args: Vec<CfmlValue>) -> CfmlResult {
     let args = binary_arg0_as_array(args);
     match args.get(0) {
         Some(CfmlValue::Array(arr)) => {
+            // Lucee ArrayMid: start must be >= 1; a count of -1 (the default)
+            // means "to the end" and anything below -1 is an error. The old
+            // `as usize` casts turned -1 into usize::MAX, so `start + count`
+            // overflowed (debug panic) or sliced `[1..0]` (release panic).
+            let start = get_int(&args, 1);
+            if start < 1 {
+                return Err(CfmlError::expression(format!(
+                    "Invalid call of the function [arrayMid], second Argument [start] is invalid, \
+                     Parameter which is now [{}] must be a positive integer",
+                    start
+                )));
+            }
+            let count = if args.len() > 2 { get_int(&args, 2) } else { -1 };
+            if count < -1 {
+                return Err(CfmlError::expression(format!(
+                    "Invalid call of the function [arrayMid], third Argument [count] is invalid, \
+                     Parameter which is now [{}] must be a non-negative integer or -1 (for the rest)",
+                    count
+                )));
+            }
             let snap = arr.snapshot();
-            let start = (get_int(&args, 1) as usize).saturating_sub(1);
-            let count = get_int(&args, 2) as usize;
-            let end = std::cmp::min(start + count, snap.len());
+            let start = (start - 1) as usize;
             if start >= snap.len() {
                 return Ok(CfmlValue::array(Vec::new()));
             }
+            let end = if count == -1 {
+                snap.len()
+            } else {
+                start.saturating_add(count as usize).min(snap.len())
+            };
             Ok(CfmlValue::array(snap[start..end].to_vec()))
         }
         _ => Err(CfmlError::runtime("arrayMid() requires an array".to_string())),
@@ -18641,13 +18923,30 @@ fn fn_array_mid(args: Vec<CfmlValue>) -> CfmlResult {
 fn fn_array_splice(args: Vec<CfmlValue>) -> CfmlResult {
     match args.get(0) {
         Some(CfmlValue::Array(arr)) => {
-            let index = (get_int(&args, 1) as usize).saturating_sub(1);
-            let len = arr.len();
-            let delete_count = if args.len() > 2 {
-                get_int(&args, 2) as usize
+            // Bounds follow Lucee's ArraySplice, which throws for nothing: an
+            // index below 1 counts back from the end (`size + index + 1`), one
+            // past the end clamps to `size + 1`; a length of -1 (the default)
+            // removes to the end and a length below -1 removes nothing. The old
+            // `as usize` casts turned -1 into usize::MAX, so `index +
+            // delete_count` overflowed (debug) or drained `1..0` (release).
+            let len = arr.len() as i64;
+            let mut idx = get_int(&args, 1);
+            if idx < 1 {
+                idx = len + idx + 1;
+            } else if idx > len {
+                idx = len + 1;
+            }
+            let idx = idx.max(1);
+            let length = if args.len() > 2 { get_int(&args, 2) } else { -1 };
+            let delete_count = if length == -1 {
+                len - idx + 1
+            } else if length < -1 {
+                0
             } else {
-                len.saturating_sub(index)
-            };
+                length.min(len - idx + 1)
+            }
+            .max(0) as usize;
+            let index = (idx - 1) as usize;
             let replacements: Vec<CfmlValue> = match args.get(3) {
                 Some(CfmlValue::Array(r)) => r.snapshot(),
                 _ => Vec::new(),
@@ -18655,7 +18954,7 @@ fn fn_array_splice(args: Vec<CfmlValue>) -> CfmlResult {
             // Reference semantics: splice the shared array in place and return
             // the removed elements (matches Lucee/JS — the original is modified).
             let removed = arr.with_write(|v| {
-                let end = std::cmp::min(index + delete_count, v.len());
+                let end = std::cmp::min(index.saturating_add(delete_count), v.len());
                 let removed: Vec<CfmlValue> = if index < v.len() {
                     v.drain(index..end).collect()
                 } else {
@@ -18676,7 +18975,10 @@ fn fn_array_splice(args: Vec<CfmlValue>) -> CfmlResult {
 fn fn_array_range(args: Vec<CfmlValue>) -> CfmlResult {
     let from = get_int(&args, 0);
     let to = get_int(&args, 1);
-    let mut result = Vec::new();
+    // `arrayRange(1, 4000000000)` pushed until the process was killed.
+    let span = (to as i128 - from as i128).abs() + 1;
+    check_array_growth("arrayRange", "to", span.min(i64::MAX as i128) as i64, 0)?;
+    let mut result = Vec::with_capacity(span as usize);
     if from <= to {
         for i in from..=to {
             result.push(CfmlValue::Int(i));
@@ -18831,7 +19133,12 @@ fn fn_null_value(_args: Vec<CfmlValue>) -> CfmlResult {
 
 fn fn_increment_value(args: Vec<CfmlValue>) -> CfmlResult {
     match args.get(0) {
-        Some(CfmlValue::Int(i)) => Ok(CfmlValue::Int(i + 1)),
+        // Past i64::MAX the result promotes to a double (Lucee computes in
+        // doubles throughout); `i + 1` panicked in debug and wrapped in release.
+        Some(CfmlValue::Int(i)) => Ok(match i.checked_add(1) {
+            Some(r) => CfmlValue::Int(r),
+            None => CfmlValue::Double(*i as f64 + 1.0),
+        }),
         Some(CfmlValue::Double(d)) => Ok(CfmlValue::Double(d + 1.0)),
         Some(v) => {
             let n = v.as_string().parse::<f64>().unwrap_or(0.0);
@@ -18844,7 +19151,10 @@ fn fn_increment_value(args: Vec<CfmlValue>) -> CfmlResult {
 
 fn fn_decrement_value(args: Vec<CfmlValue>) -> CfmlResult {
     match args.get(0) {
-        Some(CfmlValue::Int(i)) => Ok(CfmlValue::Int(i - 1)),
+        Some(CfmlValue::Int(i)) => Ok(match i.checked_sub(1) {
+            Some(r) => CfmlValue::Int(r),
+            None => CfmlValue::Double(*i as f64 - 1.0),
+        }),
         Some(CfmlValue::Double(d)) => Ok(CfmlValue::Double(d - 1.0)),
         Some(v) => {
             let n = v.as_string().parse::<f64>().unwrap_or(0.0);
@@ -18905,22 +19215,54 @@ fn fn_query_column_exists(args: Vec<CfmlValue>) -> CfmlResult {
 fn fn_query_slice(args: Vec<CfmlValue>) -> CfmlResult {
     match args.get(0) {
         Some(CfmlValue::Query(q)) => {
-            let offset = (get_int(&args, 1) as usize).saturating_sub(1);
-            let sliced = q.with_read(|d| {
-                let row_count = d.row_count();
-                let length = if args.len() > 2 {
-                    get_int(&args, 2) as usize
-                } else {
-                    row_count.saturating_sub(offset)
-                };
-                let end = std::cmp::min(offset + length, row_count);
-                let new_data: Vec<std::sync::Arc<Vec<CfmlValue>>> = if offset < row_count {
-                    d.data.iter().map(|col| std::sync::Arc::new(col[offset..end].to_vec())).collect()
-                } else {
-                    d.columns.iter().map(|_| std::sync::Arc::new(Vec::new())).collect()
-                };
-                CfmlQueryData { columns: d.columns.clone(), data: new_data, sql: None, execution_time: None, current_row: 1, row_keys: Default::default() }
-            });
+            // Bounds follow Lucee's QuerySlice: an empty query is an error; an
+            // offset <= 0 counts back from the end (repeatedly, like
+            // arraySlice); a length > 0 is a count, a length <= 0 stops that
+            // many rows before the end; an offset or offset+length past the
+            // recordcount throws. The old `as usize` casts turned a length of
+            // -1 into usize::MAX, so `offset + length` overflowed (debug) or
+            // sliced `[1..0]` (release).
+            let mut offset = get_int(&args, 1);
+            let length = if args.len() > 2 { get_int(&args, 2) } else { 0 };
+            let sliced = q.with_read(|d| -> Result<CfmlQueryData, CfmlError> {
+                let n = d.row_count() as i64;
+                if n == 0 {
+                    return Err(CfmlError::expression(
+                        "Invalid call of the function [querySlice], first Argument [query] is \
+                         invalid, Query cannot be empty"
+                            .to_string(),
+                    ));
+                }
+                if offset <= 0 {
+                    // Lucee adds `n` until the offset is positive; the closed
+                    // form avoids 2^63 iterations for an offset of i64::MIN.
+                    offset = offset.rem_euclid(n);
+                    if offset == 0 {
+                        offset = n;
+                    }
+                }
+                if n < offset {
+                    return Err(CfmlError::expression(
+                        "Invalid call of the function [querySlice], second Argument [offset] is \
+                         invalid, offset cannot be greater than the recordcount of the query"
+                            .to_string(),
+                    ));
+                }
+                let to = if length > 0 { offset + length - 1 } else { n + length };
+                if n < to {
+                    return Err(CfmlError::expression(
+                        "Invalid call of the function [querySlice], third Argument [length] is \
+                         invalid, offset+length cannot be greater than the recordcount of the query"
+                            .to_string(),
+                    ));
+                }
+                let start = (offset - 1) as usize;
+                // `to < offset` is an empty result, as in Lucee's `for (i = from; i <= to; …)`.
+                let end = (to.max(offset - 1)) as usize;
+                let new_data: Vec<std::sync::Arc<Vec<CfmlValue>>> =
+                    d.data.iter().map(|col| std::sync::Arc::new(col[start..end].to_vec())).collect();
+                Ok(CfmlQueryData { columns: d.columns.clone(), data: new_data, sql: None, execution_time: None, current_row: 1, row_keys: Default::default() })
+            })?;
             Ok(CfmlValue::Query(CfmlQuery::from_data(sliced)))
         }
         _ => Err(CfmlError::runtime("querySlice() requires a query".to_string())),
@@ -19314,7 +19656,8 @@ fn fn_file_read_binary(args: Vec<CfmlValue>) -> CfmlResult {
         return crate::file_handles::read_binary(args);
     }
     let path = get_str(&args, 0);
-    match std::fs::read(&path) {
+    // Regular files only: `fileReadBinary("/dev/zero")` read until the process died.
+    match cfml_common::vfs::read_regular_file(&path) {
         Ok(bytes) => Ok(CfmlValue::binary(bytes)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             Err(CfmlError::file_not_found(format!("The file [{}] does not exist", path)))
@@ -19868,7 +20211,7 @@ fn fn_cfmail(args: Vec<CfmlValue>) -> CfmlResult {
                     let filename = path.file_name()
                         .map(|n| n.to_string_lossy().to_string())
                         .unwrap_or_else(|| "attachment".to_string());
-                    match std::fs::read(path) {
+                    match cfml_common::vfs::read_regular_file(file_path) {
                         Ok(data) => {
                             let attachment = Attachment::new(filename)
                                 .body(data, ContentType::parse("application/octet-stream").unwrap());
@@ -19914,7 +20257,7 @@ fn fn_cfmail(args: Vec<CfmlValue>) -> CfmlResult {
                 let filename = path.file_name()
                     .map(|n| n.to_string_lossy().to_string())
                     .unwrap_or_else(|| "attachment".to_string());
-                match std::fs::read(path) {
+                match cfml_common::vfs::read_regular_file(file_path) {
                     Ok(data) => {
                         let attachment = Attachment::new(filename)
                             .body(data, ContentType::parse("application/octet-stream").unwrap());
@@ -20392,15 +20735,50 @@ fn fn_generate_pbkdf_key(args: Vec<CfmlValue>) -> CfmlResult {
     // generated. Strings still work: they are taken as their UTF-8 bytes.
     let passphrase = get_bytes(&args, 1);
     let salt = get_bytes(&args, 2);
-    let iterations = get_int(&args, 3) as u32;
-    let key_size_bits = get_int(&args, 4) as usize;
-    let key_size_bytes = key_size_bits / 8;
+    let iterations = get_int(&args, 3);
+    let key_size_bits = get_int(&args, 4);
 
-    if iterations == 0 {
-        return Err(CfmlError::runtime("generatePBKDFKey: iterations must be greater than 0".to_string()));
+    // Java's PBEKeySpec refuses an iterationCount or keyLength below 1
+    // ("invalid iterationCount value" / "invalid keyLength value"). The old
+    // `as u32` / `as usize` casts turned -1 into 4,294,967,295 iterations (a
+    // multi-hour hang) and -8 bits into a 2 EB key buffer (allocator abort).
+    // The upper caps are RustCFML's: PBKDF2 is deliberately slow per iteration,
+    // so an iteration count from user input is a denial-of-service lever, and
+    // no real key is wider than 4096 bits.
+    const MAX_PBKDF_ITERATIONS: i64 = 10_000_000;
+    const MAX_PBKDF_KEY_BITS: i64 = 4096;
+    if iterations < 1 {
+        return Err(CfmlError::expression(format!(
+            "Invalid call of the function [generatePBKDFKey], fourth Argument [iterations] is \
+             invalid, invalid iterationCount value [{}]; it must be greater than 0",
+            iterations
+        )));
     }
+    if iterations > MAX_PBKDF_ITERATIONS {
+        return Err(CfmlError::expression(format!(
+            "Invalid call of the function [generatePBKDFKey], fourth Argument [iterations] is \
+             invalid, [{}] exceeds the maximum of [{}]",
+            iterations, MAX_PBKDF_ITERATIONS
+        )));
+    }
+    if key_size_bits < 1 {
+        return Err(CfmlError::expression(format!(
+            "Invalid call of the function [generatePBKDFKey], fifth Argument [keySize] is \
+             invalid, invalid keyLength value [{}]; it must be greater than 0",
+            key_size_bits
+        )));
+    }
+    if key_size_bits > MAX_PBKDF_KEY_BITS {
+        return Err(CfmlError::expression(format!(
+            "Invalid call of the function [generatePBKDFKey], fifth Argument [keySize] is \
+             invalid, [{}] bits exceeds the maximum of [{}]",
+            key_size_bits, MAX_PBKDF_KEY_BITS
+        )));
+    }
+    let iterations = iterations as u32;
+    let key_size_bytes = (key_size_bits / 8) as usize;
     if key_size_bytes == 0 {
-        return Err(CfmlError::runtime("generatePBKDFKey: keySize must be greater than 0".to_string()));
+        return Err(CfmlError::runtime("generatePBKDFKey: keySize must be at least 8 bits".to_string()));
     }
 
     let mut derived_key = vec![0u8; key_size_bytes];
@@ -20641,7 +21019,7 @@ pub(crate) fn fn_yaml_serialize(args: Vec<CfmlValue>) -> CfmlResult {
 #[cfg(feature = "yaml")]
 fn fn_yaml_deserialize_file(args: Vec<CfmlValue>) -> CfmlResult {
     let path = get_str(&args, 0);
-    let content = std::fs::read_to_string(&path).map_err(|e| {
+    let content = cfml_common::vfs::read_regular_file_to_string(&path).map_err(|e| {
         CfmlError::runtime(format!("yamlDeserializeFile: cannot read [{}]: {}", path, e))
     })?;
     fn_yaml_deserialize(vec![CfmlValue::string(content)])
@@ -20733,7 +21111,7 @@ impl jsonschema::Retrieve for FileRefRetriever {
         let s = uri.as_str();
         // file:///abs/path -> /abs/path ; tolerate a plain path too.
         let path = s.strip_prefix("file://").unwrap_or(s);
-        let content = std::fs::read_to_string(path)?;
+        let content = cfml_common::vfs::read_regular_file_to_string(path)?;
         Ok(parse_json_lenient(&content)?)
     }
 }

@@ -37,6 +37,16 @@ const PROC_RESULT_MARKER: &str = "__cfproc_result_name";
 
 const MAX_EXPR_DEPTH: usize = 64;
 
+/// Maximum number of operands one run of the same precedence level may chain
+/// (`a & b & c & …`, `1 + 1 + …`). Such a chain parses iteratively but builds
+/// a LEFT-DEEP tree whose every later walker — the bytecode compiler, the
+/// static scans, the AST's own `Drop` — descends one native frame per
+/// operand, so `MAX_EXPR_DEPTH` (which only bounds explicit nesting) never
+/// saw it: a 50,000-term `evaluate()` string aborted the process. Generated
+/// SQL/text builders reach a few hundred terms; 20,000 is far above that and
+/// measured to walk cleanly on both debug and release builds.
+const MAX_CHAIN_TERMS: usize = 20_000;
+
 /// Maximum statement nesting depth (nested blocks / function declarations).
 ///
 /// A `parse_statement` frame is far larger than an expression frame, so this
@@ -6255,6 +6265,19 @@ impl Parser {
         Ok(())
     }
 
+    /// Count one more operand on the binary-operator chain being parsed,
+    /// erroring past `MAX_CHAIN_TERMS` (see there).
+    fn count_chain_term(&self, terms: &mut usize) -> Result<(), ParseError> {
+        *terms += 1;
+        if *terms > MAX_CHAIN_TERMS {
+            return Err(self.parse_error(&format!(
+                "expression nesting too deep: more than {} operands chained in one expression",
+                MAX_CHAIN_TERMS
+            )));
+        }
+        Ok(())
+    }
+
     fn parse_expression(&mut self) -> Result<Expression, ParseError> {
         // Bound expression recursion so deeply nested input (e.g. `((((...))))`)
         // returns a parse error instead of overflowing the stack.
@@ -6404,9 +6427,11 @@ impl Parser {
 
     fn parse_imp(&mut self) -> Result<Expression, ParseError> {
         let mut left = self.parse_eqv()?;
+        let mut terms = 0usize;
 
         while self.match_token(&Token::ImpKeyword) {
             let right = Box::new(self.parse_eqv()?);
+            self.count_chain_term(&mut terms)?;
             left = Expression::BinaryOp(Box::new(BinaryOp {
                 left: Box::new(left),
                 operator: BinaryOpType::Imp,
@@ -6420,9 +6445,11 @@ impl Parser {
 
     fn parse_eqv(&mut self) -> Result<Expression, ParseError> {
         let mut left = self.parse_xor()?;
+        let mut terms = 0usize;
 
         while self.match_token(&Token::EqvKeyword) {
             let right = Box::new(self.parse_xor()?);
+            self.count_chain_term(&mut terms)?;
             left = Expression::BinaryOp(Box::new(BinaryOp {
                 left: Box::new(left),
                 operator: BinaryOpType::Eqv,
@@ -6436,9 +6463,11 @@ impl Parser {
 
     fn parse_xor(&mut self) -> Result<Expression, ParseError> {
         let mut left = self.parse_or()?;
+        let mut terms = 0usize;
 
         while self.match_token(&Token::XorKeyword) {
             let right = Box::new(self.parse_or()?);
+            self.count_chain_term(&mut terms)?;
             left = Expression::BinaryOp(Box::new(BinaryOp {
                 left: Box::new(left),
                 operator: BinaryOpType::Xor,
@@ -6452,9 +6481,11 @@ impl Parser {
 
     fn parse_or(&mut self) -> Result<Expression, ParseError> {
         let mut left = self.parse_and()?;
+        let mut terms = 0usize;
 
         while self.match_token(&Token::BarBar) || self.match_token(&Token::OrKeyword) {
             let right = Box::new(self.parse_and()?);
+            self.count_chain_term(&mut terms)?;
             left = Expression::BinaryOp(Box::new(BinaryOp {
                 left: Box::new(left),
                 operator: BinaryOpType::Or,
@@ -6468,9 +6499,11 @@ impl Parser {
 
     fn parse_and(&mut self) -> Result<Expression, ParseError> {
         let mut left = self.parse_not()?;
+        let mut terms = 0usize;
 
         while self.match_token(&Token::AmpAmp) || self.match_token(&Token::AndKeyword) {
             let right = Box::new(self.parse_not()?);
+            self.count_chain_term(&mut terms)?;
             left = Expression::BinaryOp(Box::new(BinaryOp {
                 left: Box::new(left),
                 operator: BinaryOpType::And,
@@ -6501,11 +6534,13 @@ impl Parser {
 
     fn parse_equality(&mut self) -> Result<Expression, ParseError> {
         let mut left = self.parse_comparison()?;
+        let mut terms = 0usize;
 
         loop {
             // `EQUAL` / `EQUALS` (verbose alias for EQ) and `==`/`EQ`.
             if self.match_token(&Token::EqualEqualEqual) {
                 let right = Box::new(self.parse_comparison()?);
+                self.count_chain_term(&mut terms)?;
                 left = Expression::BinaryOp(Box::new(BinaryOp {
                     left: Box::new(left),
                     operator: BinaryOpType::StrictEqual,
@@ -6514,6 +6549,7 @@ impl Parser {
                 }));
             } else if self.match_token(&Token::BangEqualEqual) {
                 let right = Box::new(self.parse_comparison()?);
+                self.count_chain_term(&mut terms)?;
                 left = Expression::BinaryOp(Box::new(BinaryOp {
                     left: Box::new(left),
                     operator: BinaryOpType::StrictNotEqual,
@@ -6526,6 +6562,7 @@ impl Parser {
                 || self.match_word("equals")
             {
                 let right = Box::new(self.parse_comparison()?);
+                self.count_chain_term(&mut terms)?;
                 left = Expression::BinaryOp(Box::new(BinaryOp {
                     left: Box::new(left),
                     operator: BinaryOpType::Equal,
@@ -6540,6 +6577,7 @@ impl Parser {
                     BinaryOpType::Equal
                 };
                 let right = Box::new(self.parse_comparison()?);
+                self.count_chain_term(&mut terms)?;
                 left = Expression::BinaryOp(Box::new(BinaryOp {
                     left: Box::new(left),
                     operator,
@@ -6548,6 +6586,7 @@ impl Parser {
                 }));
             } else if self.match_token(&Token::BangEqual) || self.match_token(&Token::NeqKeyword) {
                 let right = Box::new(self.parse_comparison()?);
+                self.count_chain_term(&mut terms)?;
                 left = Expression::BinaryOp(Box::new(BinaryOp {
                     left: Box::new(left),
                     operator: BinaryOpType::NotEqual,
@@ -6563,6 +6602,7 @@ impl Parser {
                 self.advance(); // NOT
                 self.advance(); // EQUAL / EQUALS
                 let right = Box::new(self.parse_comparison()?);
+                self.count_chain_term(&mut terms)?;
                 left = Expression::BinaryOp(Box::new(BinaryOp {
                     left: Box::new(left),
                     operator: BinaryOpType::NotEqual,
@@ -6579,10 +6619,12 @@ impl Parser {
 
     fn parse_comparison(&mut self) -> Result<Expression, ParseError> {
         let mut left = self.parse_contains()?;
+        let mut terms = 0usize;
 
         loop {
             if self.match_token(&Token::Greater) || self.match_token(&Token::GtKeyword) {
                 let right = Box::new(self.parse_contains()?);
+                self.count_chain_term(&mut terms)?;
                 left = Expression::BinaryOp(Box::new(BinaryOp {
                     left: Box::new(left),
                     operator: BinaryOpType::Greater,
@@ -6591,6 +6633,7 @@ impl Parser {
                 }));
             } else if self.match_token(&Token::GreaterEqual) || self.match_token(&Token::GteKeyword) {
                 let right = Box::new(self.parse_contains()?);
+                self.count_chain_term(&mut terms)?;
                 left = Expression::BinaryOp(Box::new(BinaryOp {
                     left: Box::new(left),
                     operator: BinaryOpType::GreaterEqual,
@@ -6599,6 +6642,7 @@ impl Parser {
                 }));
             } else if self.match_token(&Token::Less) || self.match_token(&Token::LtKeyword) {
                 let right = Box::new(self.parse_contains()?);
+                self.count_chain_term(&mut terms)?;
                 left = Expression::BinaryOp(Box::new(BinaryOp {
                     left: Box::new(left),
                     operator: BinaryOpType::Less,
@@ -6607,6 +6651,7 @@ impl Parser {
                 }));
             } else if self.match_token(&Token::LessEqual) || self.match_token(&Token::LteKeyword) {
                 let right = Box::new(self.parse_contains()?);
+                self.count_chain_term(&mut terms)?;
                 left = Expression::BinaryOp(Box::new(BinaryOp {
                     left: Box::new(left),
                     operator: BinaryOpType::LessEqual,
@@ -6622,6 +6667,7 @@ impl Parser {
                     BinaryOpType::GreaterEqual,
                 );
                 let right = Box::new(self.parse_contains()?);
+                self.count_chain_term(&mut terms)?;
                 left = Expression::BinaryOp(Box::new(BinaryOp {
                     left: Box::new(left),
                     operator,
@@ -6637,6 +6683,7 @@ impl Parser {
                     BinaryOpType::LessEqual,
                 );
                 let right = Box::new(self.parse_contains()?);
+                self.count_chain_term(&mut terms)?;
                 left = Expression::BinaryOp(Box::new(BinaryOp {
                     left: Box::new(left),
                     operator,
@@ -6723,9 +6770,11 @@ impl Parser {
 
     fn parse_concatenation(&mut self) -> Result<Expression, ParseError> {
         let mut left = self.parse_term()?;
+        let mut terms = 0usize;
 
         while self.match_token(&Token::Amp) {
             let right = Box::new(self.parse_term()?);
+            self.count_chain_term(&mut terms)?;
             left = Expression::BinaryOp(Box::new(BinaryOp {
                 left: Box::new(left),
                 operator: BinaryOpType::Concat,
@@ -6739,6 +6788,7 @@ impl Parser {
 
     fn parse_term(&mut self) -> Result<Expression, ParseError> {
         let mut left = self.parse_factor()?;
+        let mut terms = 0usize;
 
         while self.match_token(&Token::Plus) || self.match_token(&Token::Minus) {
             let operator = match self.previous().token {
@@ -6746,6 +6796,7 @@ impl Parser {
                 _ => BinaryOpType::Sub,
             };
             let right = Box::new(self.parse_factor()?);
+            self.count_chain_term(&mut terms)?;
             left = Expression::BinaryOp(Box::new(BinaryOp {
                 left: Box::new(left),
                 operator,
@@ -6759,6 +6810,7 @@ impl Parser {
 
     fn parse_factor(&mut self) -> Result<Expression, ParseError> {
         let mut left = self.parse_power()?;
+        let mut terms = 0usize;
 
         while self.match_token(&Token::Star)
             || self.match_token(&Token::Slash)
@@ -6773,6 +6825,7 @@ impl Parser {
                 _ => BinaryOpType::Mod,
             };
             let right = Box::new(self.parse_power()?);
+            self.count_chain_term(&mut terms)?;
             left = Expression::BinaryOp(Box::new(BinaryOp {
                 left: Box::new(left),
                 operator,
@@ -6784,17 +6837,23 @@ impl Parser {
         Ok(left)
     }
 
+    /// `^` is LEFT-associative in CFML — `2^3^2` is `(2^3)^2` = 64 on Lucee
+    /// (`AbstrCFMLExprTransformer.expoOp` folds a `while` loop leftwards) and
+    /// on ACF; mathematics' right-associative convention does not apply.
+    /// Consuming a single `^` here made the second one a parse error.
     fn parse_power(&mut self) -> Result<Expression, ParseError> {
-        let left = self.parse_unary()?;
+        let mut left = self.parse_unary()?;
+        let mut terms = 0usize;
 
-        if self.match_token(&Token::Caret) {
+        while self.match_token(&Token::Caret) {
             let right = Box::new(self.parse_unary()?);
-            return Ok(Expression::BinaryOp(Box::new(BinaryOp {
+            self.count_chain_term(&mut terms)?;
+            left = Expression::BinaryOp(Box::new(BinaryOp {
                 left: Box::new(left),
                 operator: BinaryOpType::Pow,
                 right,
                 location: self.current_location(),
-            })));
+            }));
         }
 
         Ok(left)

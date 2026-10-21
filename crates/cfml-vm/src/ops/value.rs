@@ -89,7 +89,13 @@ pub(crate) fn op_swap(stack: &mut Vec<CfmlValue>) {
 pub(crate) fn op_add(stack: &mut Vec<CfmlValue>) -> Result<(), CfmlError> {
     arith_binary_op(stack, |a, b| {
         Ok(match (&a, &b) {
-            (CfmlValue::Int(i), CfmlValue::Int(j)) => CfmlValue::Int(i + j),
+            // Past i64 the sum promotes to a double, as `-` and `*` already do
+            // (and as Lucee, computing in doubles, always did). `i + j` panicked
+            // in a debug build and wrapped to a negative in release.
+            (CfmlValue::Int(i), CfmlValue::Int(j)) => match i.checked_add(*j) {
+                Some(s) => CfmlValue::Int(s),
+                None => CfmlValue::Double(*i as f64 + *j as f64),
+            },
             (CfmlValue::Double(x), CfmlValue::Double(y)) => CfmlValue::Double(x + y),
             (CfmlValue::Int(i), CfmlValue::Double(d)) => CfmlValue::Double(*i as f64 + d),
             (CfmlValue::Double(d), CfmlValue::Int(i)) => CfmlValue::Double(d + *i as f64),

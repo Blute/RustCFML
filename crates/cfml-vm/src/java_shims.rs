@@ -2306,7 +2306,7 @@ pub fn handle_java_files(method: &str, args: Vec<CfmlValue>, _object: &CfmlValue
                     "Files.readAllBytes: argument must be a Path or path string".to_string(),
                 ));
             };
-            let data = std::fs::read(&path).map_err(|e| {
+            let data = cfml_common::vfs::read_regular_file(&path).map_err(|e| {
                 CfmlError::io_exception(format!("Files.readAllBytes({}): {}", path, e))
             })?;
             // Same "native byte[]" shape as String.getBytes() — a CFML Array of
@@ -4115,7 +4115,7 @@ pub fn handle_java_bufferedreader(
             };
             let mut lines: Vec<CfmlValue> = Vec::new();
             if !path.is_empty() {
-                let content = match std::fs::read(&path) {
+                let content = match cfml_common::vfs::read_regular_file(&path) {
                     Ok(bytes) => decode_bytes(&bytes, &charset),
                     Err(e) => {
                         return Err(CfmlError::runtime(format!(
@@ -4210,7 +4210,7 @@ pub fn handle_java_propertyresourcebundle(
                 shim.insert("__prb_data".to_string(), CfmlValue::strukt(ValueMap::default()));
                 return Ok(CfmlValue::strukt(shim));
             }
-            let content = std::fs::read_to_string(&path).map_err(|e| {
+            let content = cfml_common::vfs::read_regular_file_to_string(&path).map_err(|e| {
                 CfmlError::runtime(format!(
                     "PropertyResourceBundle: cannot read properties file [{}]: {}",
                     path, e
@@ -7850,8 +7850,18 @@ pub fn java_hash_code(v: &CfmlValue) -> i32 {
 /// large-magnitude integer literals (`-1` is a `Long`-like `Int` here but a
 /// `Double` on Lucee). So `x = -1; x.equals( -1.0 )` is false here and true on
 /// Lucee. Same-spelling comparisons — the ones code actually writes — agree.
-pub fn java_equals(a: &CfmlValue, b: &CfmlValue) -> bool {
-    match (a, b) {
+pub fn java_equals(a: &CfmlValue, b: &CfmlValue) -> Result<bool, CfmlError> {
+    let mut guard = cfml_common::equality::DeepEqGuard::new();
+    java_equals_with(a, b, &mut guard)
+}
+
+/// [`java_equals`] continuing an enclosing walk's cycle/depth bookkeeping.
+fn java_equals_with(
+    a: &CfmlValue,
+    b: &CfmlValue,
+    guard: &mut cfml_common::equality::DeepEqGuard,
+) -> Result<bool, CfmlError> {
+    Ok(match (a, b) {
         (CfmlValue::Int(x), CfmlValue::Int(y)) => x == y,
         // Double.equals compares doubleToLongBits, so NaN equals NaN and
         // 0.0 does NOT equal -0.0 — deliberately not `x == y`.
@@ -7864,29 +7874,48 @@ pub fn java_equals(a: &CfmlValue, b: &CfmlValue) -> bool {
         // Identity first, as `cfml_deep_equal` does: the same backing handle is
         // equal without walking it, which is what keeps a self-referential graph
         // from recursing forever — a function's live `local` scope holds the
-        // variable that holds it (`var s = local; s.equals(s)`, GH #465).
-        (CfmlValue::Array(x), CfmlValue::Array(y)) if x.backing_ptr() == y.backing_ptr() => true,
-        (CfmlValue::Struct(x), CfmlValue::Struct(y)) if x.backing_ptr() == y.backing_ptr() => true,
+        // variable that holds it (`var s = local; s.equals(s)`, GH #465). Two
+        // DISTINCT cyclic graphs (`a.self = a; b.self = b; a.equals(b)`) are
+        // the guard's job: it settles a container pair met twice as equal and
+        // fails, catchably, when the native stack is nearly gone.
         (CfmlValue::Array(x), CfmlValue::Array(y)) => {
+            if guard.enter(x.backing_ptr(), y.backing_ptr())? {
+                return Ok(true);
+            }
             let (xs, ys) = (x.snapshot(), y.snapshot());
-            xs.len() == ys.len()
-                && xs
-                    .iter()
-                    .zip(ys.iter())
-                    .all(|(ex, ey)| java_equals(ex, ey))
+            if xs.len() != ys.len() {
+                return Ok(false);
+            }
+            for (ex, ey) in xs.iter().zip(ys.iter()) {
+                if !java_equals_with(ex, ey, guard)? {
+                    return Ok(false);
+                }
+            }
+            true
         }
         (CfmlValue::Struct(x), CfmlValue::Struct(y)) => {
+            if guard.enter(x.backing_ptr(), y.backing_ptr())? {
+                return Ok(true);
+            }
             let (xs, ys) = (x.snapshot(), y.snapshot());
-            xs.len() == ys.len()
-                && xs.iter().all(|(k, xv)| {
-                    ys.iter()
-                        .find(|(yk, _)| yk.eq_ignore_ascii_case(k))
-                        .is_some_and(|(_, yv)| java_equals(xv, yv))
-                })
+            if xs.len() != ys.len() {
+                return Ok(false);
+            }
+            for (k, xv) in xs.iter() {
+                match ys.iter().find(|(yk, _)| yk.eq_ignore_ascii_case(k)) {
+                    Some((_, yv)) => {
+                        if !java_equals_with(xv, yv, guard)? {
+                            return Ok(false);
+                        }
+                    }
+                    None => return Ok(false),
+                }
+            }
+            true
         }
         (CfmlValue::Null, CfmlValue::Null) => true,
         _ => false,
-    }
+    })
 }
 
 /// The JVM `Comparable.compareTo` for a CFML value, as a sign (-1/0/1).

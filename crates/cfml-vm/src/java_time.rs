@@ -102,6 +102,31 @@ fn arg_i64(args: &[CfmlValue], i: usize) -> i64 {
         .unwrap_or(0)
 }
 
+/// Java's `Math.multiplyExact` / `addExact`: the millisecond conversions in
+/// `java.time` throw `ArithmeticException("long overflow")` rather than wrap.
+/// `Instant.ofEpochSecond(Long.MAX_VALUE)`, `plusSeconds(Long.MAX_VALUE)` and
+/// `Duration.ofDays(Long.MAX_VALUE)` used to panic (debug) or wrap (release).
+fn long_overflow() -> CfmlError {
+    CfmlError::arithmetic("long overflow")
+}
+
+fn checked_scale(amount: i64, factor: i64) -> Result<i64, CfmlError> {
+    amount.checked_mul(factor).ok_or_else(long_overflow)
+}
+
+/// Argument `i` scaled to milliseconds by `factor`, or `long overflow`.
+fn scaled(args: &[CfmlValue], i: usize, factor: i64) -> Result<i64, CfmlError> {
+    checked_scale(arg_i64(args, i), factor)
+}
+
+fn ms_add(ms: i64, delta: i64) -> Result<i64, CfmlError> {
+    ms.checked_add(delta).ok_or_else(long_overflow)
+}
+
+fn ms_sub(ms: i64, delta: i64) -> Result<i64, CfmlError> {
+    ms.checked_sub(delta).ok_or_else(long_overflow)
+}
+
 /// Build the ChronoUnit enum holder with all its constant tokens as keys.
 fn make_chronounit() -> CfmlValue {
     let mut m = shim_map(CHRONOUNIT_CLASS);
@@ -252,7 +277,7 @@ fn dispatch_datetime(class: &str, m: &str, args: Vec<CfmlValue>, object: &CfmlVa
             return Ok(make_instant_like(class, ms, Some("Z")));
         }
         "ofepochsecond" => {
-            return Ok(make_instant_like(class, arg_i64(&args, 0) * 1000, Some("Z")));
+            return Ok(make_instant_like(class, scaled(&args, 0, 1000)?, Some("Z")));
         }
         _ => {}
     }
@@ -261,23 +286,23 @@ fn dispatch_datetime(class: &str, m: &str, args: Vec<CfmlValue>, object: &CfmlVa
     let ndt = millis_to_ndt(ms);
     let out = |n: i64| Ok(make_instant_like(class, n, Some("Z")));
     match m {
-        "plusdays" => out(ms + arg_i64(&args, 0) * 86_400_000),
-        "minusdays" => out(ms - arg_i64(&args, 0) * 86_400_000),
-        "plushours" => out(ms + arg_i64(&args, 0) * 3_600_000),
-        "minushours" => out(ms - arg_i64(&args, 0) * 3_600_000),
-        "plusminutes" => out(ms + arg_i64(&args, 0) * 60_000),
-        "minusminutes" => out(ms - arg_i64(&args, 0) * 60_000),
-        "plusseconds" => out(ms + arg_i64(&args, 0) * 1000),
-        "minusseconds" => out(ms - arg_i64(&args, 0) * 1000),
-        "plusweeks" => out(ms + arg_i64(&args, 0) * 7 * 86_400_000),
-        "minusweeks" => out(ms - arg_i64(&args, 0) * 7 * 86_400_000),
+        "plusdays" => out(ms_add(ms, scaled(&args, 0, 86_400_000)?)?),
+        "minusdays" => out(ms_sub(ms, scaled(&args, 0, 86_400_000)?)?),
+        "plushours" => out(ms_add(ms, scaled(&args, 0, 3_600_000)?)?),
+        "minushours" => out(ms_sub(ms, scaled(&args, 0, 3_600_000)?)?),
+        "plusminutes" => out(ms_add(ms, scaled(&args, 0, 60_000)?)?),
+        "minusminutes" => out(ms_sub(ms, scaled(&args, 0, 60_000)?)?),
+        "plusseconds" => out(ms_add(ms, scaled(&args, 0, 1000)?)?),
+        "minusseconds" => out(ms_sub(ms, scaled(&args, 0, 1000)?)?),
+        "plusweeks" => out(ms_add(ms, scaled(&args, 0, 7 * 86_400_000)?)?),
+        "minusweeks" => out(ms_sub(ms, scaled(&args, 0, 7 * 86_400_000)?)?),
         "plusmonths" => out(ndt_to_millis(add_months(ndt, arg_i64(&args, 0)))),
         "minusmonths" => out(ndt_to_millis(add_months(ndt, -arg_i64(&args, 0)))),
-        "plusyears" => out(ndt_to_millis(add_months(ndt, arg_i64(&args, 0) * 12))),
-        "minusyears" => out(ndt_to_millis(add_months(ndt, -arg_i64(&args, 0) * 12))),
+        "plusyears" => out(ndt_to_millis(add_months(ndt, scaled(&args, 0, 12)?))),
+        "minusyears" => out(ndt_to_millis(add_months(ndt, -scaled(&args, 0, 12)?))),
         // plus(amount, unit) or plus(duration); minus(...) — approximate.
-        "plus" => out(ms + amount_millis(&args)),
-        "minus" => out(ms - amount_millis(&args)),
+        "plus" => out(ms_add(ms, amount_millis(&args)?)?),
+        "minus" => out(ms_sub(ms, amount_millis(&args)?)?),
         "isbefore" => Ok(CfmlValue::Bool(arg_millis(args.first().unwrap_or(&CfmlValue::Null)).map(|o| ms < o).unwrap_or(false))),
         "isafter" => Ok(CfmlValue::Bool(arg_millis(args.first().unwrap_or(&CfmlValue::Null)).map(|o| ms > o).unwrap_or(false))),
         "isequal" | "equals" => Ok(CfmlValue::Bool(arg_millis(args.first().unwrap_or(&CfmlValue::Null)).map(|o| ms == o).unwrap_or(false))),
@@ -320,7 +345,7 @@ fn dispatch_instant(m: &str, args: Vec<CfmlValue>, object: &CfmlValue) -> CfmlRe
     match m {
         "now" => Ok(make_instant_like(INSTANT_CLASS, now_millis(), None)),
         "ofepochmilli" => Ok(make_instant_like(INSTANT_CLASS, arg_i64(&args, 0), None)),
-        "ofepochsecond" => Ok(make_instant_like(INSTANT_CLASS, arg_i64(&args, 0) * 1000, None)),
+        "ofepochsecond" => Ok(make_instant_like(INSTANT_CLASS, scaled(&args, 0, 1000)?, None)),
         _ => {
             let ms = self_millis(object);
             match m {
@@ -331,8 +356,8 @@ fn dispatch_instant(m: &str, args: Vec<CfmlValue>, object: &CfmlValue) -> CfmlRe
                     let zone = args.first().and_then(zone_of).unwrap_or_else(|| "Z".to_string());
                     Ok(make_instant_like(ZONEDDATETIME_CLASS, ms, Some(&zone)))
                 }
-                "plusmillis" => Ok(make_instant_like(INSTANT_CLASS, ms + arg_i64(&args, 0), None)),
-                "plusseconds" => Ok(make_instant_like(INSTANT_CLASS, ms + arg_i64(&args, 0) * 1000, None)),
+                "plusmillis" => Ok(make_instant_like(INSTANT_CLASS, ms_add(ms, arg_i64(&args, 0))?, None)),
+                "plusseconds" => Ok(make_instant_like(INSTANT_CLASS, ms_add(ms, scaled(&args, 0, 1000)?)?, None)),
                 "isbefore" => Ok(CfmlValue::Bool(arg_millis(args.first().unwrap_or(&CfmlValue::Null)).map(|o| ms < o).unwrap_or(false))),
                 "isafter" => Ok(CfmlValue::Bool(arg_millis(args.first().unwrap_or(&CfmlValue::Null)).map(|o| ms > o).unwrap_or(false))),
                 "tostring" => Ok(CfmlValue::string(millis_to_ndt(ms).format("%Y-%m-%dT%H:%M:%SZ").to_string())),
@@ -345,17 +370,17 @@ fn dispatch_instant(m: &str, args: Vec<CfmlValue>, object: &CfmlValue) -> CfmlRe
 fn dispatch_duration(m: &str, args: Vec<CfmlValue>, object: &CfmlValue) -> CfmlResult {
     // Static factories.
     match m {
-        "ofdays" => return Ok(make_duration(arg_i64(&args, 0) * 86_400_000)),
-        "ofhours" => return Ok(make_duration(arg_i64(&args, 0) * 3_600_000)),
-        "ofminutes" => return Ok(make_duration(arg_i64(&args, 0) * 60_000)),
-        "ofseconds" => return Ok(make_duration(arg_i64(&args, 0) * 1000)),
+        "ofdays" => return Ok(make_duration(scaled(&args, 0, 86_400_000)?)),
+        "ofhours" => return Ok(make_duration(scaled(&args, 0, 3_600_000)?)),
+        "ofminutes" => return Ok(make_duration(scaled(&args, 0, 60_000)?)),
+        "ofseconds" => return Ok(make_duration(scaled(&args, 0, 1000)?)),
         "ofmillis" => return Ok(make_duration(arg_i64(&args, 0))),
         "ofnanos" => return Ok(make_duration(arg_i64(&args, 0) / 1_000_000)),
         "of" => {
             // of(amount, unit) — unit is a ChronoUnit token string.
             let amt = arg_i64(&args, 0);
             let unit = args.get(1).map(|v| v.as_string().to_ascii_uppercase()).unwrap_or_default();
-            return Ok(make_duration(amt * unit_millis(&unit)));
+            return Ok(make_duration(checked_scale(amt, unit_millis(&unit))?));
         }
         "between" => {
             let a = args.first().and_then(arg_millis).unwrap_or(0);
@@ -372,15 +397,15 @@ fn dispatch_duration(m: &str, args: Vec<CfmlValue>, object: &CfmlValue) -> CfmlR
         "tohours" => Ok(CfmlValue::Int(ms / 3_600_000)),
         "todays" => Ok(CfmlValue::Int(ms / 86_400_000)),
         "getnano" => Ok(CfmlValue::Int((ms % 1000) * 1_000_000)),
-        "plus" => Ok(make_duration(ms + args.first().and_then(arg_dur_millis).unwrap_or(0))),
-        "minus" => Ok(make_duration(ms - args.first().and_then(arg_dur_millis).unwrap_or(0))),
-        "withseconds" => Ok(make_duration(arg_i64(&args, 0) * 1000 + (ms % 1000))),
+        "plus" => Ok(make_duration(ms_add(ms, args.first().and_then(arg_dur_millis).unwrap_or(0))?)),
+        "minus" => Ok(make_duration(ms_sub(ms, args.first().and_then(arg_dur_millis).unwrap_or(0))?)),
+        "withseconds" => Ok(make_duration(ms_add(scaled(&args, 0, 1000)?, ms % 1000)?)),
         "withnanos" => Ok(make_duration((ms / 1000) * 1000 + arg_i64(&args, 0) / 1_000_000)),
-        "plusseconds" => Ok(make_duration(ms + arg_i64(&args, 0) * 1000)),
-        "plusmillis" => Ok(make_duration(ms + arg_i64(&args, 0))),
-        "plusminutes" => Ok(make_duration(ms + arg_i64(&args, 0) * 60_000)),
-        "plushours" => Ok(make_duration(ms + arg_i64(&args, 0) * 3_600_000)),
-        "plusdays" => Ok(make_duration(ms + arg_i64(&args, 0) * 86_400_000)),
+        "plusseconds" => Ok(make_duration(ms_add(ms, scaled(&args, 0, 1000)?)?)),
+        "plusmillis" => Ok(make_duration(ms_add(ms, arg_i64(&args, 0))?)),
+        "plusminutes" => Ok(make_duration(ms_add(ms, scaled(&args, 0, 60_000)?)?)),
+        "plushours" => Ok(make_duration(ms_add(ms, scaled(&args, 0, 3_600_000)?)?)),
+        "plusdays" => Ok(make_duration(ms_add(ms, scaled(&args, 0, 86_400_000)?)?)),
         "isnegative" => Ok(CfmlValue::Bool(ms < 0)),
         "iszero" => Ok(CfmlValue::Bool(ms == 0)),
         "tostring" => Ok(CfmlValue::string(format!("PT{}S", ms / 1000))),
@@ -398,7 +423,7 @@ fn dispatch_period(m: &str, args: Vec<CfmlValue>, object: &CfmlValue) -> CfmlRes
     };
     match m {
         "ofdays" => Ok(mk(arg_i64(&args, 0), 0, 0)),
-        "ofweeks" => Ok(mk(arg_i64(&args, 0) * 7, 0, 0)),
+        "ofweeks" => Ok(mk(scaled(&args, 0, 7)?, 0, 0)),
         "ofmonths" => Ok(mk(0, arg_i64(&args, 0), 0)),
         "ofyears" => Ok(mk(0, 0, arg_i64(&args, 0))),
         "of" => Ok(mk(arg_i64(&args, 2), arg_i64(&args, 1), arg_i64(&args, 0))),
@@ -493,18 +518,18 @@ fn add_months(ndt: NaiveDateTime, months: i64) -> NaiveDateTime {
 }
 
 /// Milliseconds for `plus(amount, unit)` / `plus(duration)` argument shapes.
-fn amount_millis(args: &[CfmlValue]) -> i64 {
+fn amount_millis(args: &[CfmlValue]) -> Result<i64, CfmlError> {
     // plus(duration)
     if let Some(d) = args.first().and_then(arg_dur_millis) {
-        return d;
+        return Ok(d);
     }
     // plus(amount, unit)
     if args.len() >= 2 {
         let amt = args[0].as_string().trim().parse::<i64>().unwrap_or(0);
         let unit = args[1].as_string().to_ascii_uppercase();
-        return amt * unit_millis(&unit);
+        return checked_scale(amt, unit_millis(&unit));
     }
-    0
+    Ok(0)
 }
 
 fn unit_millis(unit: &str) -> i64 {

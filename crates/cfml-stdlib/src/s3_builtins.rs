@@ -114,7 +114,7 @@ pub fn fn_s3_upload(args: Vec<CfmlValue>) -> CfmlResult {
     let _location = arg_opt_string(&args, 4);
     let (k, s, h) = cred_args(&args, 5);
 
-    let body = std::fs::read(&source)
+    let body = cfml_common::vfs::read_regular_file(&source)
         .map_err(|e| err(format!("S3Upload: failed to read source '{}': {}", source, e)))?;
     let (client, cfg) = client_for_args(k.as_deref(), s.as_deref(), h.as_deref())?;
     let ct = guess_content_type(&object).map(|s| s.to_string());

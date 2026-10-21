@@ -5710,6 +5710,36 @@ impl CfmlCompiler {
         }
     }
 
+    /// The opcode for a plain (non-assignment, non-short-circuit) binary
+    /// operator.
+    fn binary_opcode(operator: BinaryOpType) -> BytecodeOp {
+        match operator {
+            BinaryOpType::Add => BytecodeOp::Add,
+            BinaryOpType::Sub => BytecodeOp::Sub,
+            BinaryOpType::Mul => BytecodeOp::Mul,
+            BinaryOpType::Div => BytecodeOp::Div,
+            BinaryOpType::Mod => BytecodeOp::Mod,
+            BinaryOpType::Pow => BytecodeOp::Pow,
+            BinaryOpType::IntDiv => BytecodeOp::IntDiv,
+            BinaryOpType::Concat => BytecodeOp::Concat,
+            BinaryOpType::Equal => BytecodeOp::Eq,
+            BinaryOpType::NotEqual => BytecodeOp::Neq,
+            BinaryOpType::StrictEqual => BytecodeOp::StrictEq,
+            BinaryOpType::StrictNotEqual => BytecodeOp::StrictNeq,
+            BinaryOpType::Less => BytecodeOp::Lt,
+            BinaryOpType::LessEqual => BytecodeOp::Lte,
+            BinaryOpType::Greater => BytecodeOp::Gt,
+            BinaryOpType::GreaterEqual => BytecodeOp::Gte,
+            BinaryOpType::And | BinaryOpType::Or => unreachable!(), // short-circuit path
+            BinaryOpType::Xor => BytecodeOp::Xor,
+            BinaryOpType::Contains => BytecodeOp::Contains,
+            BinaryOpType::DoesNotContain => BytecodeOp::DoesNotContain,
+            BinaryOpType::Eqv => BytecodeOp::Eqv,
+            BinaryOpType::Imp => BytecodeOp::Imp,
+            BinaryOpType::Assign => BytecodeOp::Null, // Should not reach here
+        }
+    }
+
     fn compile_expression(&mut self, expr: &Expression, instructions: &mut Vec<BytecodeOp>) {
         match expr {
             Expression::Literal(lit) => match &lit.value {
@@ -5973,23 +6003,40 @@ impl CfmlCompiler {
                 // decides the result (e.g. `false AND throws()`).
                 if matches!(binop.operator, BinaryOpType::And | BinaryOpType::Or) {
                     let jump_on_short_circuit = matches!(binop.operator, BinaryOpType::Or);
-                    self.compile_expression(&binop.left, instructions);
-                    let short_jump_idx = instructions.len();
-                    instructions.push(if jump_on_short_circuit {
-                        BytecodeOp::JumpIfTrue(0)
-                    } else {
-                        BytecodeOp::JumpIfFalse(0)
-                    });
-                    self.compile_expression(&binop.right, instructions);
-                    let second_jump_idx = instructions.len();
-                    instructions.push(if jump_on_short_circuit {
-                        BytecodeOp::JumpIfTrue(0)
-                    } else {
-                        BytecodeOp::JumpIfFalse(0)
-                    });
-                    // Fall-through path: neither short-circuited — result is
+                    // `a or b or c or …` parses LEFT-deep; compiling each
+                    // nested node recursively cost a native frame of this
+                    // function per operand (an abort past a few thousand).
+                    // Flatten the same-operator spine: every operand, in source
+                    // order, is followed by one conditional jump to a shared
+                    // landing pad, so evaluation order and short-circuiting are
+                    // exactly those of the nested emission. A node of the OTHER
+                    // operator ends the spine and compiles as an operand.
+                    let mut spine: Vec<&BinaryOp> = vec![binop];
+                    let mut leftmost: &Expression = &binop.left;
+                    while let Expression::BinaryOp(inner) = leftmost {
+                        if inner.operator != binop.operator {
+                            break;
+                        }
+                        spine.push(inner);
+                        leftmost = &inner.left;
+                    }
+                    let mut short_jumps: Vec<usize> = Vec::with_capacity(spine.len() + 1);
+                    let mut emit_operand = |this: &mut Self, operand: &Expression, instructions: &mut Vec<BytecodeOp>| {
+                        this.compile_expression(operand, instructions);
+                        short_jumps.push(instructions.len());
+                        instructions.push(if jump_on_short_circuit {
+                            BytecodeOp::JumpIfTrue(0)
+                        } else {
+                            BytecodeOp::JumpIfFalse(0)
+                        });
+                    };
+                    emit_operand(self, leftmost, instructions);
+                    for node in spine.iter().rev() {
+                        emit_operand(self, &node.right, instructions);
+                    }
+                    // Fall-through path: no operand short-circuited — result is
                     // !jump_on_short_circuit for AND (true), and FALSE for OR
-                    // (we got here because both were not-true).
+                    // (we got here because none was true).
                     if jump_on_short_circuit {
                         instructions.push(BytecodeOp::False);
                     } else {
@@ -6005,18 +6052,14 @@ impl CfmlCompiler {
                         instructions.push(BytecodeOp::False);
                     }
                     let end_target = instructions.len();
-                    // Patch the three forward jumps.
-                    match &mut instructions[short_jump_idx] {
-                        BytecodeOp::JumpIfTrue(off) | BytecodeOp::JumpIfFalse(off) => {
-                            *off = short_target;
+                    // Patch the forward jumps.
+                    for idx in short_jumps {
+                        match &mut instructions[idx] {
+                            BytecodeOp::JumpIfTrue(off) | BytecodeOp::JumpIfFalse(off) => {
+                                *off = short_target;
+                            }
+                            _ => unreachable!(),
                         }
-                        _ => unreachable!(),
-                    }
-                    match &mut instructions[second_jump_idx] {
-                        BytecodeOp::JumpIfTrue(off) | BytecodeOp::JumpIfFalse(off) => {
-                            *off = short_target;
-                        }
-                        _ => unreachable!(),
                     }
                     if let BytecodeOp::Jump(off) = &mut instructions[done_jump_idx] {
                         *off = end_target;
@@ -6024,35 +6067,33 @@ impl CfmlCompiler {
                     return;
                 }
 
-                self.compile_expression(&binop.left, instructions);
-                self.compile_expression(&binop.right, instructions);
-
-                let op = match binop.operator {
-                    BinaryOpType::Add => BytecodeOp::Add,
-                    BinaryOpType::Sub => BytecodeOp::Sub,
-                    BinaryOpType::Mul => BytecodeOp::Mul,
-                    BinaryOpType::Div => BytecodeOp::Div,
-                    BinaryOpType::Mod => BytecodeOp::Mod,
-                    BinaryOpType::Pow => BytecodeOp::Pow,
-                    BinaryOpType::IntDiv => BytecodeOp::IntDiv,
-                    BinaryOpType::Concat => BytecodeOp::Concat,
-                    BinaryOpType::Equal => BytecodeOp::Eq,
-                    BinaryOpType::NotEqual => BytecodeOp::Neq,
-                    BinaryOpType::StrictEqual => BytecodeOp::StrictEq,
-                    BinaryOpType::StrictNotEqual => BytecodeOp::StrictNeq,
-                    BinaryOpType::Less => BytecodeOp::Lt,
-                    BinaryOpType::LessEqual => BytecodeOp::Lte,
-                    BinaryOpType::Greater => BytecodeOp::Gt,
-                    BinaryOpType::GreaterEqual => BytecodeOp::Gte,
-                    BinaryOpType::And | BinaryOpType::Or => unreachable!(), // handled above
-                    BinaryOpType::Xor => BytecodeOp::Xor,
-                    BinaryOpType::Contains => BytecodeOp::Contains,
-                    BinaryOpType::DoesNotContain => BytecodeOp::DoesNotContain,
-                    BinaryOpType::Eqv => BytecodeOp::Eqv,
-                    BinaryOpType::Imp => BytecodeOp::Imp,
-                    BinaryOpType::Assign => BytecodeOp::Null, // Should not reach here
-                };
-                instructions.push(op);
+                // A chain of plain binary operators (`a & b & c & …`,
+                // `1 + 1 + …`) parses to a LEFT-deep tree: the first operand
+                // sits N levels down the `left` spine. Compiling that spine by
+                // recursion cost one native frame of this (large) function per
+                // operand, so a long generated expression overflowed the stack —
+                // an abort. Walk the spine iteratively instead: collect the
+                // nodes down to the leftmost operand, emit that operand, then
+                // each node's right operand and opcode from the bottom up. The
+                // bytecode is identical to the recursive emission's. Assignment
+                // and short-circuit nodes end the spine (handled above).
+                let mut spine: Vec<&BinaryOp> = vec![binop];
+                let mut leftmost: &Expression = &binop.left;
+                while let Expression::BinaryOp(inner) = leftmost {
+                    if matches!(
+                        inner.operator,
+                        BinaryOpType::Assign | BinaryOpType::And | BinaryOpType::Or
+                    ) {
+                        break;
+                    }
+                    spine.push(inner);
+                    leftmost = &inner.left;
+                }
+                self.compile_expression(leftmost, instructions);
+                for node in spine.iter().rev() {
+                    self.compile_expression(&node.right, instructions);
+                    instructions.push(Self::binary_opcode(node.operator));
+                }
             }
             Expression::UnaryOp(unary) => {
                 match unary.operator {

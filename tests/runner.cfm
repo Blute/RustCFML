@@ -16,6 +16,7 @@ include "harness.cfm";
 
 <!--- --- Core Language --- --->
 <cf_runtest file="core/test_variables.cfm" />
+<cf_runtest file="core/test_recursion_and_depth_limits.cfm" />
 <cf_runtest file="core/test_script_tag_statement_refusals.cfm" rustcfmlOnly="true" />
 <cf_runtest file="core/test_numeric_string_equality.cfm" />
 <cf_runtest file="core/test_closure_var_shadows_captured_after_nested_call.cfm" />
@@ -91,6 +92,9 @@ include "harness.cfm";
 <!--- views came back empty on an otherwise-booting framework (PR #108). --->
 <cf_runtest file="core/test_savecontent_scoped_target.cfm" />
 <cf_runtest file="core/test_operators.cfm" />
+<!--- `+`, `++`, `+=`, `*=`, loop increments and incrementValue() past i64 --->
+<!--- promote to a double (Lucee computes in doubles); they used to panic/wrap. --->
+<cf_runtest file="core/test_integer_overflow_promotion.cfm" />
 <cf_runtest file="core/test_strict_equality.cfm" />
 <cf_runtest file="core/test_subscript_autovivify.cfm" />
 <!--- Scope-qualified nested auto-vivification (variables.$class.name = ...): the residual --->
@@ -383,6 +387,10 @@ include "harness.cfm";
 <cf_runtest file="stdlib/test_cache_properties.cfm" rustcfmlOnly="true" />
 <cf_runtest file="stdlib/test_higher_order_functions.cfm" />
 <cf_runtest file="stdlib/test_bitmask_functions.cfm" />
+<!--- Out-of-range arguments that used to panic, abort or hang the engine now --->
+<!--- throw (or take Lucee's defined result). RustCFML-only assertions (growth --->
+<!--- caps, PBKDF caps, /dev/zero refusal) are guarded in-file with isRustCFML(). --->
+<cf_runtest file="stdlib/test_argument_bounds.cfm" />
 <cf_runtest file="stdlib/test_xml_dom_functions.cfm" />
 <cf_runtest file="stdlib/test_xml_tostring.cfm" />
 <cf_runtest file="stdlib/test_misc_functions.cfm" />

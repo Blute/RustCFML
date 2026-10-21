@@ -602,14 +602,30 @@ impl CfmlArray {
 
     /// Set a 0-based index, growing the array (filling gaps with `Null`, Lucee
     /// semantics) when `idx` is past the end.
-    pub fn set_or_grow(&self, idx: usize, value: CfmlValue) {
+    ///
+    /// Refuses to grow by more than `MAX_GROW_PER_CALL` slots: `a[4000000000]
+    /// = 1` used to fill 4e9 nulls (minutes, then OOM) and
+    /// `a[9223372036854775807] = 1` overflowed the `Vec` capacity and panicked.
+    /// The error names the 1-based position the caller wrote.
+    pub fn set_or_grow(&self, idx: usize, value: CfmlValue) -> Result<(), CfmlError> {
         let mut g = self.0.write();
         if idx < g.len() {
             g[idx] = value;
         } else {
+            let grow = idx - g.len() + 1;
+            if grow > crate::container_size::MAX_GROW_PER_CALL {
+                return Err(CfmlError::expression(format!(
+                    "can not set Element at position [{}]: growing the array by [{}] elements \
+                     exceeds the maximum of [{}] in one write",
+                    idx as u128 + 1,
+                    grow,
+                    crate::container_size::MAX_GROW_PER_CALL
+                )));
+            }
             g.resize(idx, CfmlValue::Null);
             g.push(value);
         }
+        Ok(())
     }
 
     #[inline]

@@ -14,7 +14,17 @@ pub struct Parser {
     current: Token,
     /// 0-based counter assigning indices to positional `?` parameters.
     param_index: usize,
+    /// Current expression/subquery nesting, bounded by `MAX_NESTING_DEPTH`.
+    depth: usize,
 }
+
+/// Deepest nesting of parentheses, CASE arms, function arguments and
+/// subqueries one statement may use. The recursive descent below spends a
+/// handful of native frames per level; without a bound a
+/// `WHERE ((((…((a=1))…))))` built from 50,000 parentheses recursed until the
+/// thread's stack overflowed, which aborts the process rather than failing
+/// the query. 512 is far beyond any generated SQL.
+const MAX_NESTING_DEPTH: usize = 512;
 
 /// Parse a SQL string into a [`Statement`].
 pub fn parse(sql: &str) -> Result<Statement, String> {
@@ -29,7 +39,20 @@ impl Parser {
             lexer,
             current,
             param_index: 0,
+            depth: 0,
         }
+    }
+
+    /// Enter one nesting level; pair with `self.depth -= 1` on the way out.
+    fn enter_depth(&mut self) -> Result<(), String> {
+        if self.depth >= MAX_NESTING_DEPTH {
+            return Err(format!(
+                "SQL expression nesting too deep (limit {} levels)",
+                MAX_NESTING_DEPTH
+            ));
+        }
+        self.depth += 1;
+        Ok(())
     }
 
     fn advance(&mut self) {
@@ -100,6 +123,15 @@ impl Parser {
     // ── Statement level ────────────────────────────────────────────────
 
     fn parse_select_statement(&mut self) -> Result<SelectStatement, String> {
+        // A derived table (`FROM (SELECT …)`) nests without passing through
+        // `parse_expr`, so subqueries count here too.
+        self.enter_depth()?;
+        let r = self.parse_select_statement_inner();
+        self.depth -= 1;
+        r
+    }
+
+    fn parse_select_statement_inner(&mut self) -> Result<SelectStatement, String> {
         let mut body = self.parse_select_core()?;
 
         let mut unions = Vec::new();
@@ -367,7 +399,10 @@ impl Parser {
     // ── Expressions ────────────────────────────────────────────────────
 
     fn parse_expr(&mut self) -> Result<Expr, String> {
-        self.parse_or()
+        self.enter_depth()?;
+        let r = self.parse_or();
+        self.depth -= 1;
+        r
     }
 
     fn parse_expr_list(&mut self) -> Result<Vec<Expr>, String> {

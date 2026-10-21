@@ -231,7 +231,7 @@ fn source_bytes(v: Option<&CfmlValue>) -> Result<(Vec<u8>, String), CfmlError> {
                     "PdfRead: a file path or PDF binary is required".to_string(),
                 ));
             }
-            let bytes = std::fs::read(&path).map_err(|e| {
+            let bytes = cfml_common::vfs::read_regular_file(&path).map_err(|e| {
                 CfmlError::runtime(format!("PdfRead: cannot read '{}': {}", path, e))
             })?;
             Ok((bytes, path))

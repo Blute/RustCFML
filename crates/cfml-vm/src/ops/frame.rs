@@ -227,8 +227,9 @@ pub(crate) fn op_set_index(
             // Interior mutability on the shared handle: the
             // assignment is visible to every alias. Auto-grow
             // past the end leaves skipped slots as null holes
-            // (Lucee): `a=[]; a[3]="x"` → len 3, [1]/[2] null.
-            arr.set_or_grow(idx, value);
+            // (Lucee): `a=[]; a[3]="x"` → len 3, [1]/[2] null. A position
+            // that would grow the array past `MAX_GROW_PER_CALL` throws.
+            arr.set_or_grow(idx, value)?;
         }
         CfmlValue::Struct(s) => {
             // The key is only BORROWED here. `CfmlValue::String` is an

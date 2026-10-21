@@ -474,10 +474,11 @@ unsafe extern "C" fn h_arr_set(raw: *mut Ctx, h: ValueHandle, i: usize, v: Value
     let target = out_or!(value_of(raw, h), abi::status::BAD_HANDLE);
     let value = out_or!(value_of(raw, v), abi::status::BAD_HANDLE);
     match target {
-        CfmlValue::Array(a) => {
-            a.set_or_grow(i, value);
-            abi::status::OK
-        }
+        CfmlValue::Array(a) => match a.set_or_grow(i, value) {
+            Ok(()) => abi::status::OK,
+            // Past the growth cap: an index the array cannot have.
+            Err(_) => abi::status::NOT_FOUND,
+        },
         _ => abi::status::WRONG_TYPE,
     }
 }

@@ -361,7 +361,14 @@ pub(crate) fn op_load_arg_key(
 #[inline]
 pub(crate) fn numeric_step(v: &CfmlValue, k: i64, mul: bool) -> Result<CfmlValue, CfmlError> {
     match v {
-        CfmlValue::Int(i) => Ok(CfmlValue::Int(if mul { i * k } else { i + k })),
+        // Past i64 the result promotes to a double, matching the binary
+        // operators (and Lucee's double arithmetic). `i * k` / `i + k` panicked
+        // in a debug build and wrapped in release — `i++` on i64::MAX, or a
+        // `for` loop whose increment crosses it, took the engine down.
+        CfmlValue::Int(i) => Ok(match if mul { i.checked_mul(k) } else { i.checked_add(k) } {
+            Some(r) => CfmlValue::Int(r),
+            None => CfmlValue::Double(if mul { *i as f64 * k as f64 } else { *i as f64 + k as f64 }),
+        }),
         CfmlValue::Double(d) => Ok(CfmlValue::Double(if mul { d * k as f64 } else { d + k as f64 })),
         other => {
             let k = CfmlValue::Int(k);
