@@ -74,12 +74,12 @@ jobs:
       - uses: actions/checkout@v5
 
       # PINNED, not `stable`. A PGO profile is tied to the LLVM version that
-      # produced it (rustc 1.93.0 = LLVM 21.1.8), so a silent stable bump would
+      # produced it (rustc 1.99.1 = LLVM 22.2.0), so a silent stable bump would
       # invalidate pgo/rustcfml.profdata and quietly ship an un-profiled binary.
       # Bump this deliberately, and regenerate the profile in the same commit
       # (docs/pgo.md has the recipe).
       - name: Install Rust (pinned for PGO)
-        uses: dtolnay/rust-toolchain@1.93.0
+        uses: dtolnay/rust-toolchain@1.99.1
         with:
           components: llvm-tools
 
