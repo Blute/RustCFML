@@ -18108,14 +18108,42 @@ fn fn_xml_parse(args: Vec<CfmlValue>) -> CfmlResult {
                 }
             }
             Ok(Event::Text(ref e)) => {
-                let text = e.unescape().unwrap_or(std::borrow::Cow::Borrowed("")).to_string();
-                let trimmed = text.trim().to_string();
-                if !trimmed.is_empty() {
+                // quick-xml 0.41.0: Use xml_content() to get decoded text with entities expanded
+                let text = e.xml10_content()
+                    .map(|cow| cow.into_owned())
+                    .unwrap_or_else(|_| String::new());
+                // Don't trim here - preserve internal whitespace. Only check if non-empty.
+                if !text.is_empty() {
                     if let Some(current) = stack.last_mut() {
                         if let Some(CfmlValue::String(ref mut s)) = current.get_mut("xmlText") {
                             let inner = std::sync::Arc::make_mut(s);
-                            if !inner.is_empty() { inner.push(' '); }
-                            inner.push_str(&trimmed);
+                            inner.push_str(&text);
+                        }
+                    }
+                }
+            }
+            Ok(Event::GeneralRef(ref e)) => {
+                // quick-xml 0.41.0: Entity references like &amp; come as GeneralRef events
+                // The decode() method gives us the entity name (e.g., "amp"), we need to resolve it
+                let entity_name = e.decode()
+                    .map(|cow| cow.into_owned())
+                    .unwrap_or_else(|_| String::new());
+                
+                // Resolve standard XML entities
+                let resolved = match entity_name.as_str() {
+                    "amp" => "&",
+                    "lt" => "<",
+                    "gt" => ">",
+                    "quot" => "\"",
+                    "apos" => "'",
+                    _ => &entity_name, // Unknown entity, keep as is
+                };
+                
+                if !resolved.is_empty() {
+                    if let Some(current) = stack.last_mut() {
+                        if let Some(CfmlValue::String(ref mut s)) = current.get_mut("xmlText") {
+                            let inner = std::sync::Arc::make_mut(s);
+                            inner.push_str(resolved);
                         }
                     }
                 }
@@ -21529,7 +21557,7 @@ fn fn_cfzip(args: Vec<CfmlValue>) -> CfmlResult {
 
             for i in 0..archive.len() {
                 let mut entry = archive.by_index(i).map_err(|e| CfmlError::runtime(e.to_string()))?;
-                let name = entry.name().to_string();
+                let name = entry.name().map_err(|e| CfmlError::runtime(e.to_string()))?.to_string();
 
                 if !entry_path.is_empty() && !name.starts_with(&entry_path) {
                     continue;
@@ -21594,7 +21622,7 @@ fn fn_cfzip(args: Vec<CfmlValue>) -> CfmlResult {
 
             for i in 0..archive.len() {
                 let entry = archive.by_index(i).map_err(|e| CfmlError::runtime(e.to_string()))?;
-                let name = entry.name().to_string();
+                let name = entry.name().map_err(|e| CfmlError::runtime(e.to_string()))?.to_string();
                 let is_dir = entry.is_dir();
                 let dir = std::path::Path::new(&name).parent()
                     .map(|p| p.to_string_lossy().to_string())
@@ -21663,7 +21691,7 @@ fn fn_cfzip(args: Vec<CfmlValue>) -> CfmlResult {
                 let options = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
                 for i in 0..archive.len() {
                     let mut entry = archive.by_index(i).map_err(|e| CfmlError::runtime(e.to_string()))?;
-                    let name = entry.name().to_string();
+                    let name = entry.name().map_err(|e| CfmlError::runtime(e.to_string()))?.to_string();
                     if name == entry_path {
                         continue;
                     }

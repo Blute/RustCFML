@@ -23,5 +23,5 @@ publish = false
 # cfml-stdlib's `html`, so a build that did not enable that feature broke.
 scraper = { version = "0.22", features = ["deterministic"] }
 ego-tree = "0.10"
-quick-xml = "0.36"
+quick-xml = "0.41"
 regex = "1"

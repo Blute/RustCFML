@@ -409,7 +409,10 @@ fn package(dir: &Path, name: &str, version: &str, lib: &Path) -> Result<PathBuf,
                     Ok(e) => e,
                     Err(_) => continue,
                 };
-                let entry_name = entry.name().to_string();
+                let entry_name = match entry.name() {
+                    Ok(n) => n.to_string(),
+                    Err(_) => continue,
+                };
                 if entry_name.starts_with("lib/") && entry_name != inner {
                     let mut buf = Vec::new();
                     use std::io::Read;

@@ -352,7 +352,10 @@ fn stage_cfml(rcx: &Path, into: &Path) -> Option<PathBuf> {
             Ok(e) => e,
             Err(_) => continue,
         };
-        let name = entry.name().to_string();
+        let name = match entry.name() {
+            Ok(n) => n.to_string(),
+            Err(_) => continue,
+        };
         let Some(rel) = name.strip_prefix("cfml/") else { continue };
         if rel.is_empty() || name.ends_with('/') {
             continue;
