@@ -83,7 +83,7 @@ mysql = { version = "28", optional = true }
 postgres = { version = "0.19", optional = true, features = ["with-chrono-0_4", "with-uuid-1", "with-serde_json-1"] }
 tokio-postgres = { version = "0.7", optional = true }
 tokio-postgres-rustls = { version = "0.14", optional = true }
-rustls = { version = "0.23", optional = true }
+rustls = { version = "0.23.46", optional = true }
 rustls-native-certs = { version = "0.8", optional = true }
 rust_decimal = { version = "1", default-features = false, features = ["db-postgres"], optional = true }
 uuid = { version = "1", optional = true }
@@ -107,7 +107,7 @@ scrypt = { version = "0.11", optional = true }
 argon2 = { version = "0.5", optional = true }
 pbkdf2 = { version = "0.12", optional = true, features = ["simple"] }
 iana-time-zone = "0.1"
-quick-xml = { version = "0.36", optional = true }
+quick-xml = { version = "0.41", optional = true }
 # Pure-Rust imaging (decode/encode/resize/rotate/crop/flip). `default-features`
 # left ON — all default codecs are pure-Rust and build for wasm32. Do NOT enable
 # `avif`/`avif-native`/`hdr`-via-C: those pull C deps and break the wasm build.
@@ -164,7 +164,7 @@ resvg = { version = "0.48", optional = true }
 # PDF fonts so a PDF that names Helvetica renders the same on a server with no
 # fonts installed. NATIVE-ONLY for the same reason as `svg`.
 hayro = { version = "0.7", optional = true, features = ["embed-fonts"] }
-zip = { version = "2", default-features = false, features = ["deflate"], optional = true }
+zip = { version = "9", default-features = false, features = ["deflate"], optional = true }
 # `rustls-tls` (as distinct from `tokio1-rustls-tls`) is what enables TLS on the
 # BLOCKING `SmtpTransport` we actually use for <cfmail>. Without it the only
 # constructor available is `builder_dangerous`, i.e. no STARTTLS and no implicit

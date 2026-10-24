@@ -18036,6 +18036,7 @@ fn fn_xml_parse(args: Vec<CfmlValue>) -> CfmlResult {
 
     let xml_str = get_str(&args, 0);
     let mut reader = Reader::from_str(&xml_str);
+    let decoder = reader.decoder();
 
     let mut stack: Vec<ValueMap> = Vec::new();
     let mut root: Option<ValueMap> = None;
@@ -18108,7 +18109,10 @@ fn fn_xml_parse(args: Vec<CfmlValue>) -> CfmlResult {
                 }
             }
             Ok(Event::Text(ref e)) => {
-                let text = e.unescape().unwrap_or(std::borrow::Cow::Borrowed("")).to_string();
+                // quick_xml 0.41.0: decode text using the reader's decoder
+                let text = decoder.decode(e.as_ref())
+                    .unwrap_or(std::borrow::Cow::Borrowed(""))
+                    .into_owned();
                 let trimmed = text.trim().to_string();
                 if !trimmed.is_empty() {
                     if let Some(current) = stack.last_mut() {
@@ -21529,7 +21533,7 @@ fn fn_cfzip(args: Vec<CfmlValue>) -> CfmlResult {
 
             for i in 0..archive.len() {
                 let mut entry = archive.by_index(i).map_err(|e| CfmlError::runtime(e.to_string()))?;
-                let name = entry.name().to_string();
+                let name = entry.name().map_err(|e| CfmlError::runtime(e.to_string()))?.to_string();
 
                 if !entry_path.is_empty() && !name.starts_with(&entry_path) {
                     continue;
@@ -21594,7 +21598,7 @@ fn fn_cfzip(args: Vec<CfmlValue>) -> CfmlResult {
 
             for i in 0..archive.len() {
                 let entry = archive.by_index(i).map_err(|e| CfmlError::runtime(e.to_string()))?;
-                let name = entry.name().to_string();
+                let name = entry.name().map_err(|e| CfmlError::runtime(e.to_string()))?.to_string();
                 let is_dir = entry.is_dir();
                 let dir = std::path::Path::new(&name).parent()
                     .map(|p| p.to_string_lossy().to_string())
@@ -21663,7 +21667,7 @@ fn fn_cfzip(args: Vec<CfmlValue>) -> CfmlResult {
                 let options = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
                 for i in 0..archive.len() {
                     let mut entry = archive.by_index(i).map_err(|e| CfmlError::runtime(e.to_string()))?;
-                    let name = entry.name().to_string();
+                    let name = entry.name().map_err(|e| CfmlError::runtime(e.to_string()))?.to_string();
                     if name == entry_path {
                         continue;
                     }

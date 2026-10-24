@@ -72,7 +72,12 @@ fn parse_tree(xml: &str) -> Result<Node, String> {
                 }
             }
             Ok(Event::Text(ref e)) => {
-                let text = e.unescape().unwrap_or(std::borrow::Cow::Borrowed("")).to_string();
+                let raw = std::str::from_utf8(e.as_ref()).unwrap_or("");
+                // quick_xml 0.41.0: entity decoding is explicit via escape::unescape
+                let text = match quick_xml::escape::unescape(raw) {
+                    Ok(cow) => cow.into_owned(),
+                    Err(_) => raw.to_string(), // preserve raw on decode error
+                };
                 if !text.trim().is_empty() {
                     if let Some(cur) = stack.last_mut() {
                         cur.text.push_str(&text);
@@ -99,10 +104,12 @@ fn element_node(e: &quick_xml::events::BytesStart) -> Node {
     let mut attrs = Vec::new();
     for attr in e.attributes().flatten() {
         let key = String::from_utf8_lossy(attr.key.as_ref()).to_string();
-        let val = attr
-            .unescape_value()
-            .map(|c| c.to_string())
-            .unwrap_or_else(|_| String::from_utf8_lossy(&attr.value).to_string());
+        let raw_val = std::str::from_utf8(&attr.value).unwrap_or("");
+        // quick_xml 0.41.0: entity decoding is explicit via escape::unescape
+        let val = match quick_xml::escape::unescape(raw_val) {
+            Ok(cow) => cow.into_owned(),
+            Err(_) => raw_val.to_string(), // preserve raw on decode error
+        };
         attrs.push((key, val));
     }
     Node { name, attrs, children: Vec::new(), text: String::new() }
