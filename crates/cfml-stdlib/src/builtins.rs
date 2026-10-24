@@ -18036,7 +18036,6 @@ fn fn_xml_parse(args: Vec<CfmlValue>) -> CfmlResult {
 
     let xml_str = get_str(&args, 0);
     let mut reader = Reader::from_str(&xml_str);
-    let decoder = reader.decoder();
 
     let mut stack: Vec<ValueMap> = Vec::new();
     let mut root: Option<ValueMap> = None;
@@ -18109,17 +18108,42 @@ fn fn_xml_parse(args: Vec<CfmlValue>) -> CfmlResult {
                 }
             }
             Ok(Event::Text(ref e)) => {
-                // quick_xml 0.41.0: decode text using the reader's decoder
-                let text = decoder.decode(e.as_ref())
-                    .unwrap_or(std::borrow::Cow::Borrowed(""))
-                    .into_owned();
-                let trimmed = text.trim().to_string();
-                if !trimmed.is_empty() {
+                // quick-xml 0.41.0: Use xml_content() to get decoded text with entities expanded
+                let text = e.xml10_content()
+                    .map(|cow| cow.into_owned())
+                    .unwrap_or_else(|_| String::new());
+                // Don't trim here - preserve internal whitespace. Only check if non-empty.
+                if !text.is_empty() {
                     if let Some(current) = stack.last_mut() {
                         if let Some(CfmlValue::String(ref mut s)) = current.get_mut("xmlText") {
                             let inner = std::sync::Arc::make_mut(s);
-                            if !inner.is_empty() { inner.push(' '); }
-                            inner.push_str(&trimmed);
+                            inner.push_str(&text);
+                        }
+                    }
+                }
+            }
+            Ok(Event::GeneralRef(ref e)) => {
+                // quick-xml 0.41.0: Entity references like &amp; come as GeneralRef events
+                // The decode() method gives us the entity name (e.g., "amp"), we need to resolve it
+                let entity_name = e.decode()
+                    .map(|cow| cow.into_owned())
+                    .unwrap_or_else(|_| String::new());
+                
+                // Resolve standard XML entities
+                let resolved = match entity_name.as_str() {
+                    "amp" => "&",
+                    "lt" => "<",
+                    "gt" => ">",
+                    "quot" => "\"",
+                    "apos" => "'",
+                    _ => &entity_name, // Unknown entity, keep as is
+                };
+                
+                if !resolved.is_empty() {
+                    if let Some(current) = stack.last_mut() {
+                        if let Some(CfmlValue::String(ref mut s)) = current.get_mut("xmlText") {
+                            let inner = std::sync::Arc::make_mut(s);
+                            inner.push_str(resolved);
                         }
                     }
                 }
