@@ -1,0 +1,58 @@
+# Throwaway: shows the system-zone test on Windows (outside UTC), which CI never runs. Not part of the PR.
+name: host-zone-probe
+on:
+  push:
+    branches: [ci-probe/now-windows-host-zone]
+permissions:
+  contents: read
+jobs:
+  windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Release binary v0.742.2 and a probe page
+        run: |
+          gh release download v0.742.2 -R RustCFML/RustCFML -p rustcfml-windows-x86_64.exe -D $env:RUNNER_TEMP
+          New-Item -ItemType Directory "$env:RUNNER_TEMP\probe" | Out-Null
+          Set-Content "$env:RUNNER_TEMP\probe\now.cfm" '<cfscript>writeOutput("getTimeZone()=" & getTimeZone() & "  now()=" & dateTimeFormat(now(), "yyyy-mm-dd HH:nn:ss"));</cfscript>'
+      - name: Brisbane (UTC+10)
+        run: |
+          tzutil /s "E. Australia Standard Time"
+          "Windows zone: $(tzutil /g)   Get-Date: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')   UTC: $((Get-Date).ToUniversalTime().ToString('yyyy-MM-dd HH:mm:ss'))"
+          "Java default zone (Lucee's): $('System.out.println(java.util.TimeZone.getDefault().getID())' | & "$env:JAVA_HOME\bin\jshell.exe" -q 2>&1 | Select-String -NotMatch 'jshell')"
+          & "$env:RUNNER_TEMP\rustcfml-windows-x86_64.exe" "$env:RUNNER_TEMP\probe\now.cfm"; ""
+      - name: "Test in Brisbane (expected: FAIL)"
+        id: brisbane
+        continue-on-error: true
+        run: cargo test -p cfml-common --test system_zone_is_host_zone
+      - name: "Control: UTC"
+        run: |
+          tzutil /s "UTC"
+          "Windows zone: $(tzutil /g)   Get-Date: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+          & "$env:RUNNER_TEMP\rustcfml-windows-x86_64.exe" "$env:RUNNER_TEMP\probe\now.cfm"; ""
+      - name: "Test in UTC (expected: pass)"
+        run: cargo test -p cfml-common --test system_zone_is_host_zone
+      - name: Outcome
+        run: '"Brisbane test outcome: ${{ steps.brisbane.outcome }}"'
+  linux:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Brisbane (UTC+10), and the release binary
+        run: |
+          sudo timedatectl set-timezone Australia/Brisbane
+          echo "zone: $(timedatectl show -p Timezone --value)  date: $(date '+%F %T')"
+          gh release download v0.742.2 -R RustCFML/RustCFML -p rustcfml-linux-x86_64 -D "$RUNNER_TEMP"
+          chmod +x "$RUNNER_TEMP/rustcfml-linux-x86_64"
+          mkdir -p "$RUNNER_TEMP/probe"
+          echo '<cfscript>writeOutput("getTimeZone()=" & getTimeZone() & "  now()=" & dateTimeFormat(now(), "yyyy-mm-dd HH:nn:ss"));</cfscript>' > "$RUNNER_TEMP/probe/now.cfm"
+          "$RUNNER_TEMP/rustcfml-linux-x86_64" "$RUNNER_TEMP/probe/now.cfm"; echo
+      - name: "Test in Brisbane (expected: pass)"
+        run: cargo test -p cfml-common --test system_zone_is_host_zone
