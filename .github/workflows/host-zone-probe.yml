@@ -23,8 +23,10 @@ jobs:
       - name: Brisbane (UTC+10)
         run: |
           tzutil /s "E. Australia Standard Time"
-          "Windows zone: $(tzutil /g)   Get-Date: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')   UTC: $((Get-Date).ToUniversalTime().ToString('yyyy-MM-dd HH:mm:ss'))"
-          "Java default zone (Lucee's): $('System.out.println(java.util.TimeZone.getDefault().getID())' | & "$env:JAVA_HOME\bin\jshell.exe" -q 2>&1 | Select-String -NotMatch 'jshell')"
+          # A new process, as .NET keeps the zone it started with
+          pwsh -NoProfile -Command '"Windows zone: $(tzutil /g)   clock: $(Get-Date -Format ''yyyy-MM-dd HH:mm:ss'')   UTC: $((Get-Date).ToUniversalTime().ToString(''yyyy-MM-dd HH:mm:ss''))"'
+          Set-Content "$env:RUNNER_TEMP\Zone.java" 'public class Zone { public static void main(String[] a) { System.out.println("Java default zone (what Lucee uses): " + java.util.TimeZone.getDefault().getID() + "  " + java.time.LocalDateTime.now().withNano(0)); } }'
+          & "$env:JAVA_HOME\bin\java.exe" "$env:RUNNER_TEMP\Zone.java"
           & "$env:RUNNER_TEMP\rustcfml-windows-x86_64.exe" "$env:RUNNER_TEMP\probe\now.cfm"; ""
       - name: "Test in Brisbane (expected: FAIL)"
         id: brisbane
@@ -33,7 +35,7 @@ jobs:
       - name: "Control: UTC"
         run: |
           tzutil /s "UTC"
-          "Windows zone: $(tzutil /g)   Get-Date: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+          pwsh -NoProfile -Command '"Windows zone: $(tzutil /g)   clock: $(Get-Date -Format ''yyyy-MM-dd HH:mm:ss'')"'
           & "$env:RUNNER_TEMP\rustcfml-windows-x86_64.exe" "$env:RUNNER_TEMP\probe\now.cfm"; ""
       - name: "Test in UTC (expected: pass)"
         run: cargo test -p cfml-common --test system_zone_is_host_zone
