@@ -11275,11 +11275,42 @@ fn sweep_idle_datasource_pools_with(ttl_secs: u64) -> usize {
         return 0;
     }
     let Ok(mut manager) = get_pool_manager().lock() else { return 0 };
-    let before = manager.len();
     let ttl = std::time::Duration::from_secs(ttl_secs);
-    manager.retain(|_, e| e.last_used.elapsed() < ttl);
-    let dropped = before - manager.len();
-    if dropped > 0 {
+    
+    // Extract idle pools for out-of-lock disposal. Dropping a PoolEntry can be
+    // expensive (PostgreSQL pools hold `postgres::Client` instances whose Drop
+    // interacts with an internal runtime; doing that from a tokio worker panics
+    // with "Cannot start a runtime from within a runtime"), and holding the lock
+    // across every pool's Drop delays reconnects. Extraction + out-of-lock drop
+    // is also the sweep contract in docs/memory.md: "An in-flight request keeps
+    // its connections; only the idle pool is dropped."
+    let mut to_drop = Vec::new();
+    manager.retain(|_, e| {
+        if e.last_used.elapsed() >= ttl {
+            to_drop.push(std::mem::replace(
+                e,
+                PoolEntry {
+                    pool: Box::new(()),
+                    last_used: std::time::Instant::now(),
+                },
+            ));
+            false
+        } else {
+            true
+        }
+    });
+    let dropped = to_drop.len();
+    drop(manager);
+    
+    // Drop the pools outside the tokio runtime to avoid the postgres crate's
+    // "Cannot start a runtime from within a runtime" panic (GitHub #495). The
+    // sync `postgres::Client` wraps tokio-postgres and manages its own runtime;
+    // its Drop runs tokio code, which panics when already inside a runtime.
+    // Spawn a real OS thread (not a tokio task) so the Drop is safe.
+    if !to_drop.is_empty() {
+        std::thread::spawn(move || drop(to_drop))
+            .join()
+            .ok();
         log::debug!("[datasource] dropped {dropped} idle connection pool(s)");
     }
     dropped
